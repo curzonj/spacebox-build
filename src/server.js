@@ -6,6 +6,8 @@ var logger = require('morgan');
 var bodyParser = require('body-parser');
 var uuidGen = require('node-uuid');
 var debug = require('debug')('build');
+var Q = require('q');
+var qhttp = require("q-io/http");
 
 var app = express();
 var port = process.env.PORT || 5000;
@@ -16,8 +18,12 @@ app.use(bodyParser.urlencoded({
     extended: false
 }));
 
-var inventories = {};
-var blueprints = require('./blueprints');
+function getBlueprints() {
+    return qhttp.read(process.env.TECHDB_URL + '/blueprints').then(function (b){
+        return JSON.parse(b.toString());
+    });
+}
+
 var facilities = {
     "dummy": {
         "blueprint": "dummy"
@@ -56,36 +62,48 @@ app.post('/jobs', function(req, res) {
 
     var job = req.body;
     var facility = facilities[job.facility];
-    var facilityType = blueprints[facility.blueprint];
-    var canName = "can" + job.action.charAt(0).toUpperCase() + job.action.slice(1);
-    var canList = facilityType[canName];
-    var target = blueprints[req.body.target];
     var duration = -1;
 
-    if (canList.indexOf(job.target) == -1) {
-        res.sendStatus(400);
-    }
+    getBlueprints().then(function(blueprints) {
+        var facilityType = blueprints[facility.blueprint];
+        var canList = facilityType.production[job.action];
+        var target = blueprints[req.body.target];
 
-    if (job.action == "refine") {
-        // verify space in the attached inventory after target is removed
-        consume(job.inventory, job.target, job.quantity);
-        duration = target.refine.time;
-    } else {
-        duration = target.build.time;
+        if (!canList.some(function(e) { return e.item == job.target; })) {
+            console.log(canList);
+            console.log(job.target);
 
-        for (var key in target.build.resources) {
-            var count = target.build.resources[key];
-            consume(job.inventory, key, count*job.quantity);
+            res.status(400).send("facility is unable to produce that");
         }
 
-        if (job.action == "construct") {
-            job.quantity = 1;
-        }
-    }
+        var promises = [];
 
-    job.finishAt = (new Date().getTime() + duration*1000*job.quantity);
-    buildJobs[uuid] = job;
-    res.sendStatus(201);
+        if (job.action == "refine") {
+            // verify space in the attached inventory after target is removed
+            promises.push(consume(job.facility, job.inventory, job.target, job.quantity));
+            duration = target.refine.time;
+        } else {
+            duration = target.build.time;
+
+            for (var key in target.build.resources) {
+                var count = target.build.resources[key];
+                promises.push(consume(job.facility, job.inventory, key, count*job.quantity));
+            }
+
+            if (job.action == "construct") {
+                job.quantity = 1;
+            }
+        }
+
+        Q.all(promises).then(function() {
+            job.finishAt = (new Date().getTime() + duration*1000*job.quantity);
+            buildJobs[uuid] = job;
+
+            res.sendStatus(201);
+        }).fail(function() {
+            res.sendStatus(500);
+        });
+    });
 });
 
 app.get('/facilities', function(req, res) {
@@ -100,27 +118,27 @@ app.post('/facilities/:uuid', function(req, res) {
 
 // spodb tells us when facilities come into existance
 app.post('/facilities', function(req, res) {
-    var uuid = req.body.uuid || uuidGen.v1();
-    debug(req.body);
-    var blueprint = blueprints[req.body.blueprint];
+    getBlueprints().then(function(blueprints) {
+        console.log(req.body);
+        console.log(blueprints);
 
-    if (blueprint) {
-        facilities[uuid] = req.body;
-        if (blueprint.type == "structure" || blueprint.type == "deployable") {
-            spodb[uuid] = {
-                blueprint: uuid
-            };
+        var blueprint = blueprints[req.body.blueprint];
+
+        if (blueprint) {
+            var uuid = req.body.uuid || uuidGen.v1();
+            facilities[uuid] = req.body;
+
+            if (blueprint.type == "structure" || blueprint.type == "deployable") {
+                spodb[uuid] = {
+                    blueprint: uuid
+                };
+            }
+
+            res.sendStatus(201);
+        } else {
+            res.status(400).send("no such blueprint");
         }
-
-        res.sendStatus(201);
-    } else {
-        res.sendStatus(400);
-    }
-});
-
-// this is just a stub until we build the inventory and emit to it
-app.get('/inventories', function(req, res) {
-    res.send(inventories);
+    });
 });
 
 // this is just a stub until we build the spodb
@@ -128,29 +146,28 @@ app.get('/spodb', function(req, res) {
     res.send(spodb);
 });
 
-function consume(uuid, type, quantity) {
-    if (inventories[uuid] === undefined) {
-        inventories[uuid] = [];
-    }
-
-    inventories[uuid].push({
-        blueprint: type,
-        quantity: quantity * -1
-    });
+function updateInventory(uuid, slice, type, quantity) {
+    return qhttp.request({
+        method: "POST",
+        url: process.env.INVENTORY_URL + '/inventory/' + uuid + '/' + slice,
+        headers: { "Content-Type": "application/json" },
+        body: [ JSON.stringify({
+            type: type,
+            quantity: quantity
+        }) ]
+    }).then(function(resp) {
+        if (resp.status !== 200) {
+            throw new Error("inventory responded with " +resp.status);
+        }
+    }).done();
 }
 
-function produce(uuid, type, quantity) {
-    var obj = {
-        blueprint: type,
-        quantity: quantity
-    };
-    debug(obj);
+function consume(uuid, slice, type, quantity) {
+    return updateInventory(uuid, slice, type, quantity * -1);
+}
 
-    if (inventories[uuid] === undefined) {
-        inventories[uuid] = [];
-    }
-
-    inventories[uuid].push(obj);
+function produce(uuid, slice, type, quantity) {
+    return updateInventory(uuid, slice, type, quantity);
 }
 
 var buildWorker = setInterval(function() {
@@ -164,7 +181,7 @@ var buildWorker = setInterval(function() {
 
             switch (job.action) {
                 case "manufacture":
-                    produce(job.inventory, job.target, job.quantity);
+                    produce(job.facility, job.inventory, job.target, job.quantity);
                     break;
                 case "refine":
                     var target = blueprints[job.target];
