@@ -119,9 +119,6 @@ app.post('/facilities/:uuid', function(req, res) {
 // spodb tells us when facilities come into existance
 app.post('/facilities', function(req, res) {
     getBlueprints().then(function(blueprints) {
-        console.log(req.body);
-        console.log(blueprints);
-
         var blueprint = blueprints[req.body.blueprint];
 
         if (blueprint) {
