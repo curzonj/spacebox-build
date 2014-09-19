@@ -79,6 +79,8 @@ app.post('/jobs', function(req, res) {
         var promises = [];
 
         if (job.action == "refine") {
+            job.outputs = target.refine.outputs;
+
             // verify space in the attached inventory after target is removed
             promises.push(consume(job.facility, job.inventory, job.target, job.quantity));
             duration = target.refine.time;
@@ -146,14 +148,16 @@ app.get('/spodb', function(req, res) {
 function updateInventory(uuid, slice, type, quantity) {
     return qhttp.request({
         method: "POST",
-        url: process.env.INVENTORY_URL + '/inventory/' + uuid + '/' + slice,
+        url: process.env.INVENTORY_URL + '/inventory',
         headers: { "Content-Type": "application/json" },
-        body: [ JSON.stringify({
-            type: type,
+        body: [ JSON.stringify([{
+            inventory: uuid,
+            slice: slice,
+            blueprint: type,
             quantity: quantity
-        }) ]
+        }]) ]
     }).then(function(resp) {
-        if (resp.status !== 200) {
+        if (resp.status !== 204) {
             throw new Error("inventory responded with " +resp.status);
         }
     }).done();
@@ -181,9 +185,8 @@ var buildWorker = setInterval(function() {
                     produce(job.facility, job.inventory, job.target, job.quantity);
                     break;
                 case "refine":
-                    var target = blueprints[job.target];
-                    for (var key in target.refine.outputs) {
-                        var count = target.refine.outputs[key];
+                    for (var key in job.outputs) {
+                        var count = job.outputs[key];
                         produce(job.inventory, key, count*job.quantity);
                     }
                     break;
