@@ -112,19 +112,13 @@ app.get('/facilities', function(req, res) {
     res.send(facilities);
 });
 
-app.post('/facilities/:uuid', function(req, res) {
-    // this is when spodb has an update to an existing
-    // facility, not yet supported
-    res.sendStatus(404);
-});
-
 // spodb tells us when facilities come into existance
-app.post('/facilities', function(req, res) {
+app.post('/facilities/:uuid', function(req, res) {
     getBlueprints().then(function(blueprints) {
         var blueprint = blueprints[req.body.blueprint];
 
         if (blueprint) {
-            var uuid = req.body.uuid || uuidGen.v1();
+            var uuid = req.param('uuid');
             facilities[uuid] = req.body;
 
             if (blueprint.type == "structure" || blueprint.type == "deployable") {
