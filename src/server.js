@@ -18,8 +18,67 @@ app.use(bodyParser.urlencoded({
     extended: false
 }));
 
+var auth_token;
+
+function getAuthToken() {
+    return Q.fcall(function() {
+        var now = new Date().getTime();
+
+        if (auth_token !== undefined && auth_token.expires > now) {
+            return auth_token.token;
+        } else {
+            return qhttp.read({
+                url: process.env.AUTH_URL + '/auth?ttl=3600',
+                headers: {
+                    "Content-Type": "application/json",
+                    "Authorization": 'Basic ' + new Buffer(process.env.INTERNAL_CREDS).toString('base64')
+                }
+            }).then(function(b) {
+                auth_token = JSON.parse(b.toString());
+                return auth_token.token;
+            });
+        }
+    });
+}
+
+function authorize(req, restricted) {
+    var auth_header = req.get('Authorization');
+    if (auth_header === undefined) {
+        throw new Error("not authorized");
+    }
+
+    var parts = auth_header.split(' ');
+
+    // TODO make a way for internal apis to authorize
+    // as a specific account without having to get a
+    // different bearer token for each one. Perhaps
+    // auth will return a certain account if the authorized
+    // token has metadata appended to the end of it
+    // or is fernet encoded.
+    if (parts[0] != "Bearer") {
+        throw new Error("not authorized");
+    }
+
+    // This will fail if it's not authorized
+    return qhttp.read({
+        method: "POST",
+        url: process.env.AUTH_URL + '/token',
+        headers: {
+            "Content-Type": "application/json"
+        },
+        body: [JSON.stringify({
+            token: parts[1],
+            restricted: (restricted === true)
+        })]
+    }).then(function(body) {
+        return JSON.parse(body.toString());
+    }).fail(function(e) {
+        throw new Error("not authorized");
+    });
+}
+
 function getBlueprints() {
-    return qhttp.read(process.env.TECHDB_URL + '/blueprints').then(function (b){
+    return qhttp.read(process.env.TECHDB_URL + '/blueprints').then(function(b) {
         return JSON.parse(b.toString());
     });
 }
@@ -64,12 +123,18 @@ app.post('/jobs', function(req, res) {
     var facility = facilities[job.facility];
     var duration = -1;
 
-    getBlueprints().then(function(blueprints) {
+    Q.spread([getBlueprints(), authorize(req)], function(blueprints, auth) {
         var facilityType = blueprints[facility.blueprint];
         var canList = facilityType.production[job.action];
         var target = blueprints[req.body.target];
 
-        if (!canList.some(function(e) { return e.item == job.target; })) {
+        if (facility.account != auth.account) {
+            return res.status(401).send("not authorized to access that facility");
+        }
+
+        if (!canList.some(function(e) {
+            return e.item == job.target;
+        })) {
             console.log(canList);
             console.log(job.target);
 
@@ -81,15 +146,15 @@ app.post('/jobs', function(req, res) {
         if (job.action == "refine") {
             job.outputs = target.refine.outputs;
 
-            // verify space in the attached inventory after target is removed
-            promises.push(consume(job.facility, job.inventory, job.target, job.quantity));
+            // TODO verify space in the attached inventory after target is removed
+            promises.push(consume(auth.account, job.facility, job.inventory, job.target, job.quantity));
             duration = target.refine.time;
         } else {
             duration = target.build.time;
 
             for (var key in target.build.resources) {
                 var count = target.build.resources[key];
-                promises.push(consume(job.facility, job.inventory, key, count*job.quantity));
+                promises.push(consume(auth.account, job.facility, job.inventory, key, count * job.quantity));
             }
 
             if (job.action == "construct") {
@@ -98,27 +163,47 @@ app.post('/jobs', function(req, res) {
         }
 
         Q.all(promises).then(function() {
-            job.finishAt = (new Date().getTime() + duration*1000*job.quantity);
+            job.finishAt = (new Date().getTime() + duration * 1000 * job.quantity);
+            job.account = auth.account;
+
             buildJobs[uuid] = job;
 
             res.sendStatus(201);
-        }).fail(function() {
-            res.sendStatus(500);
-        });
+        }).fail(function(e) {
+            res.status(500).send(e.toString());
+        }).done();
     });
 });
 
 app.get('/facilities', function(req, res) {
-    res.send(facilities);
+    authorize(req).then(function(auth) {
+        if (auth.privileged && req.param('all') == 'true') {
+            res.send(facilities);
+        } else {
+            var my_facilities = {};
+
+            for (var key in facilities) {
+                var i = facilities[key];
+                if (i.account == auth.account) {
+                    my_facilities[key] = i;
+                }
+            }
+
+            res.send(my_facilities);
+        }
+    });
 });
 
 // spodb tells us when facilities come into existance
 app.post('/facilities/:uuid', function(req, res) {
-    getBlueprints().then(function(blueprints) {
+    Q.spread([getBlueprints(), authorize(req, true)], function(blueprints, auth) {
         var blueprint = blueprints[req.body.blueprint];
 
         if (blueprint) {
             var uuid = req.param('uuid');
+            var obj = req.body;
+            obj.account = auth.account;
+
             facilities[uuid] = req.body;
 
             if (blueprint.type == "structure" || blueprint.type == "deployable") {
@@ -136,39 +221,50 @@ app.post('/facilities/:uuid', function(req, res) {
 
 // this is just a stub until we build the spodb
 app.get('/spodb', function(req, res) {
-    res.send(spodb);
+    authorize(req, true).then(function(auth) {
+        res.send(spodb);
+    });
 });
 
-function updateInventory(uuid, slice, type, quantity) {
-    return qhttp.request({
-        method: "POST",
-        url: process.env.INVENTORY_URL + '/inventory',
-        headers: { "Content-Type": "application/json" },
-        body: [ JSON.stringify([{
-            inventory: uuid,
-            slice: slice,
-            blueprint: type,
-            quantity: quantity
-        }]) ]
-    }).then(function(resp) {
-        if (resp.status !== 204) {
-            throw new Error("inventory responded with " +resp.status);
-        }
-    }).done();
+function updateInventory(account, uuid, slice, type, quantity) {
+    return getAuthToken().then(function(token) {
+        return qhttp.request({
+            method: "POST",
+            url: process.env.INVENTORY_URL + '/inventory',
+            headers: {
+                "Authorization": "Bearer " + token + '/' + account,
+                "Content-Type": "application/json"
+            },
+            body: [JSON.stringify([{
+                inventory: uuid,
+                slice: slice,
+                blueprint: type,
+                quantity: quantity
+            }])]
+        }).then(function(resp) {
+            if (resp.status !== 204) {
+                resp.body.read().then(function(b) {
+                    console.log("inventory "+resp.status+" reason: "+b.toString());
+                }).done();
+
+                throw new Error("inventory responded with " + resp.status);
+            }
+        });
+    });
 }
 
-function consume(uuid, slice, type, quantity) {
-    return updateInventory(uuid, slice, type, quantity * -1);
+function consume(account, uuid, slice, type, quantity) {
+    return updateInventory(account, uuid, slice, type, quantity * -1);
 }
 
-function produce(uuid, slice, type, quantity) {
-    return updateInventory(uuid, slice, type, quantity);
+function produce(account, uuid, slice, type, quantity) {
+    return updateInventory(account, uuid, slice, type, quantity);
 }
 
 var buildWorker = setInterval(function() {
     var timestamp = new Date().getTime();
 
-    for(var uuid in buildJobs) {
+    for (var uuid in buildJobs) {
         var job = buildJobs[uuid];
         if (job.finishAt < timestamp && job.finished !== true) {
             debug(job);
@@ -176,22 +272,22 @@ var buildWorker = setInterval(function() {
 
             switch (job.action) {
                 case "manufacture":
-                    produce(job.facility, job.inventory, job.target, job.quantity);
+                    produce(job.account, job.facility, job.inventory, job.target, job.quantity);
                     break;
                 case "refine":
                     for (var key in job.outputs) {
                         var count = job.outputs[key];
-                        produce(job.inventory, key, count*job.quantity);
+                        produce(job.account, job.facility, job.inventory, key, count * job.quantity);
                     }
                     break;
                 case "construct":
-                    // in the end this will notify spodb something
-                    // was changed and spodb will notify us
+                    // TODO update inventory and out own tracking in addition
+                    // to notifying spodb
                     spodb[job.facility].blueprint = job.target;
 
                     break;
             }
-        
+
         }
     }
 }, 1000);
