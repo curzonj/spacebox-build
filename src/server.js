@@ -93,7 +93,9 @@ var spodb = {
         "blueprint": "dummy"
     }
 };
-var buildJobs = {};
+
+var queued_jobs = {};
+var running_jobs = {};
 
 var loadouts = require('./loadouts');
 var loadout_accounting = {};
@@ -147,7 +149,22 @@ app.get('/setup', function(req, res) {
 });
 
 app.get('/jobs', function(req, res) {
-    res.send(buildJobs);
+    authorize(req).then(function(auth) {
+        if (auth.privileged && req.param('all') == 'true') {
+            res.send(queued_jobs);
+        } else {
+            var my_jobs = {};
+
+            for (var key in queued_jobs) {
+                var i = queued_jobs[key];
+                if (i.account == auth.account) {
+                    my_jobs[key] = i;
+                }
+            }
+
+            res.send(my_jobs);
+        }
+    });
 });
 
 // players cancel jobs
@@ -174,6 +191,10 @@ app.post('/jobs', function(req, res) {
     var facility = facilities[job.facility];
     var duration = -1;
 
+    if (facility === undefined) {
+        return res.status(404).send("no such facility: "+job.facility);
+    }
+
     Q.spread([getBlueprints(), authorize(req)], function(blueprints, auth) {
         var facilityType = blueprints[facility.blueprint];
         var canList = facilityType.production[job.action];
@@ -198,14 +219,14 @@ app.post('/jobs', function(req, res) {
             job.outputs = target.refine.outputs;
 
             // TODO verify space in the attached inventory after target is removed
-            promises.push(consume(auth.account, job.facility, job.inventory, job.target, job.quantity));
+            promises.push(consume(auth.account, job.facility, job.slice, job.target, job.quantity));
             duration = target.refine.time;
         } else {
             duration = target.build.time;
 
             for (var key in target.build.resources) {
                 var count = target.build.resources[key];
-                promises.push(consume(auth.account, job.facility, job.inventory, key, count * job.quantity));
+                promises.push(consume(auth.account, job.facility, job.slice, key, count * job.quantity));
             }
 
             if (job.action == "construct") {
@@ -213,17 +234,17 @@ app.post('/jobs', function(req, res) {
             }
         }
 
-        Q.all(promises).then(function() {
+        return Q.all(promises).then(function() {
             job.finishAt = (new Date().getTime() + duration * 1000 * job.quantity);
             job.account = auth.account;
 
-            buildJobs[uuid] = job;
+            queued_jobs[uuid] = job;
 
             res.sendStatus(201);
-        }).fail(function(e) {
-            res.status(500).send(e.toString());
-        }).done();
-    });
+        });
+    }).fail(function(e) {
+        res.status(500).send(e.toString());
+    }).done();
 });
 
 app.get('/facilities', function(req, res) {
@@ -258,13 +279,36 @@ function buildFacility(uuid, blueprint, account) {
     }
 }
 
-// spodb tells us when facilities come into existance
+function getInventoryData(uuid, account) {
+    return getAuthToken().then(function(token) {
+        return qhttp.read({
+            method: "GET",
+            url: process.env.INVENTORY_URL + '/inventory/'+uuid,
+            headers: {
+                "Authorization": "Bearer " + token + '/' + account,
+                "Content-Type": "application/json"
+            }
+        }).then(function(body) {
+            return JSON.parse(body.toString());
+        });
+    });
+}
+
+// TODO this endpoint should be restricted when spodb
+// starts calling it and users don't have to anymore
 app.post('/facilities/:uuid', function(req, res) {
-    Q.spread([getBlueprints(), authorize(req, true)], function(blueprints, auth) {
+    var authP = authorize(req);
+    var uuid = req.param('uuid');
+    var inventoryP = authP.then(function(auth) {
+        // This verifies that the inventory exists and
+        // is owned by the same account
+        return getInventoryData(uuid, auth.account);
+    });
+
+    Q.spread([getBlueprints(), authP, inventoryP], function(blueprints, auth, inventory) {
         var blueprint = blueprints[req.body.blueprint];
 
-        if (blueprint) {
-            var uuid = req.param('uuid');
+        if (blueprint && inventory.blueprint == blueprint.uuid) {
 
             buildFacility(uuid, blueprint, auth.account);
 
@@ -272,7 +316,9 @@ app.post('/facilities/:uuid', function(req, res) {
         } else {
             res.status(400).send("no such blueprint");
         }
-    });
+    }).fail(function(e) {
+        res.status(500).send(e.toString());
+    }).done();
 });
 
 // this is just a stub until we build the spodb
@@ -328,29 +374,55 @@ function produce(account, uuid, slice, type, quantity) {
     }]);
 }
 
+function updateInventoryContainer(uuid, blueprint, account) {
+    getAuthToken().then(function(token) {
+        return qhttp.request({
+            method: "POST",
+            url: process.env.INVENTORY_URL + '/containers/'+uuid,
+            headers: {
+                "Authorization": "Bearer " + token + '/' + account,
+                "Content-Type": "application/json"
+            },
+            body: [JSON.stringify({
+                blueprint: blueprint
+            })]
+        }).then(function(resp) {
+            if (resp.status !== 204) {
+                resp.body.read().then(function(b) {
+                    console.log("inventory "+resp.status+" reason: "+b.toString());
+                }).done();
+
+                throw new Error("inventory responded with " + resp.status);
+            }
+        });
+    }).done();
+}
+
 var buildWorker = setInterval(function() {
     var timestamp = new Date().getTime();
 
-    for (var uuid in buildJobs) {
-        var job = buildJobs[uuid];
+    for (var uuid in queued_jobs) {
+        var job = queued_jobs[uuid];
         if (job.finishAt < timestamp && job.finished !== true) {
             debug(job);
             job.finished = true;
 
             switch (job.action) {
                 case "manufacture":
-                    produce(job.account, job.facility, job.inventory, job.target, job.quantity);
+                    produce(job.account, job.facility, job.slice, job.target, job.quantity);
                     break;
                 case "refine":
                     for (var key in job.outputs) {
                         var count = job.outputs[key];
-                        produce(job.account, job.facility, job.inventory, key, count * job.quantity);
+                        produce(job.account, job.facility, job.slice, key, count * job.quantity);
                     }
                     break;
                 case "construct":
-                    // TODO update inventory and out own tracking in addition
+                    // TODO update inventory and our own tracking in addition
                     // to notifying spodb
                     spodb[job.facility].blueprint = job.target;
+
+                    updateInventoryContainer(job.facility, job.target, job.account);
 
                     break;
             }
