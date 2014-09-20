@@ -95,6 +95,57 @@ var spodb = {
 };
 var buildJobs = {};
 
+var loadouts = require('./loadouts');
+var loadout_accounting = {};
+
+// TODO normally spodb would do this when an account first connects
+app.get('/setup', function(req, res) {
+    var loadout_name = req.param('loadout');
+    var loadout = loadouts[loadout_name];
+
+
+    Q.spread([getBlueprints(), authorize(req)], function(blueprints, auth) {
+        if (loadout_accounting[auth.account] !== undefined) {
+            return res.status(200).send("that account is already setup");
+        } else if (loadout === undefined) {
+            return res.status(404).send("no such loadout available");
+        } else {
+            var list = [];
+            var facilities = [];
+
+            for(var ctype in loadout) {
+                var uuid = uuidGen.v1();
+                list.push({ container_action: "create", uuid: uuid, blueprint: ctype });
+
+                if (blueprints[ctype].production !== undefined) {
+                    facilities.push({uuid: uuid, blueprint: blueprints[ctype], account: auth.account});
+                }
+
+                for(var type in loadout[ctype]) {
+                    list.push({
+                        inventory: uuid,
+                        slice: "default",
+                        blueprint: type,
+                        quantity: loadout[ctype][type]
+                    });
+                }
+            }
+
+            return updateInventory(auth.account, list).then(function() {
+                facilities.forEach(function(f) {
+                    buildFacility(f.uuid, f.blueprint, f.account);
+                });
+
+                loadout_accounting[auth.account] = loadout_name;
+
+                res.status(200).send("account setup with "+loadout_name);
+            });
+        }
+    }).fail(function(e) {
+        res.status(500).send(e.toString());
+    }).done();
+});
+
 app.get('/jobs', function(req, res) {
     res.send(buildJobs);
 });
@@ -194,6 +245,19 @@ app.get('/facilities', function(req, res) {
     });
 });
 
+function buildFacility(uuid, blueprint, account) {
+    facilities[uuid] = {
+        blueprint: blueprint.uuid,
+        account: account
+    };
+
+    if (blueprint.type == "structure" || blueprint.type == "deployable") {
+        spodb[uuid] = {
+            blueprint: uuid
+        };
+    }
+}
+
 // spodb tells us when facilities come into existance
 app.post('/facilities/:uuid', function(req, res) {
     Q.spread([getBlueprints(), authorize(req, true)], function(blueprints, auth) {
@@ -201,16 +265,8 @@ app.post('/facilities/:uuid', function(req, res) {
 
         if (blueprint) {
             var uuid = req.param('uuid');
-            var obj = req.body;
-            obj.account = auth.account;
 
-            facilities[uuid] = req.body;
-
-            if (blueprint.type == "structure" || blueprint.type == "deployable") {
-                spodb[uuid] = {
-                    blueprint: uuid
-                };
-            }
+            buildFacility(uuid, blueprint, auth.account);
 
             res.sendStatus(201);
         } else {
@@ -226,7 +282,14 @@ app.get('/spodb', function(req, res) {
     });
 });
 
-function updateInventory(account, uuid, slice, type, quantity) {
+function updateInventory(account, data) {
+    /* data = [{
+        inventory: uuid,
+        slice: slice,
+        blueprint: type,
+        quantity: quantity
+    }]
+    */
     return getAuthToken().then(function(token) {
         return qhttp.request({
             method: "POST",
@@ -235,12 +298,7 @@ function updateInventory(account, uuid, slice, type, quantity) {
                 "Authorization": "Bearer " + token + '/' + account,
                 "Content-Type": "application/json"
             },
-            body: [JSON.stringify([{
-                inventory: uuid,
-                slice: slice,
-                blueprint: type,
-                quantity: quantity
-            }])]
+            body: [JSON.stringify(data)]
         }).then(function(resp) {
             if (resp.status !== 204) {
                 resp.body.read().then(function(b) {
@@ -252,13 +310,22 @@ function updateInventory(account, uuid, slice, type, quantity) {
         });
     });
 }
-
 function consume(account, uuid, slice, type, quantity) {
-    return updateInventory(account, uuid, slice, type, quantity * -1);
+    return updateInventory(account, [{
+        inventory: uuid,
+        slice: slice,
+        blueprint: type,
+        quantity: (quantity * -1)
+    }]);
 }
 
 function produce(account, uuid, slice, type, quantity) {
-    return updateInventory(account, uuid, slice, type, quantity);
+    return updateInventory(account, [{
+        inventory: uuid,
+        slice: slice,
+        blueprint: type,
+        quantity: quantity
+    }]);
 }
 
 var buildWorker = setInterval(function() {
