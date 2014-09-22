@@ -83,19 +83,12 @@ function getBlueprints() {
     });
 }
 
-var facilities = {
-    "dummy": {
-        "blueprint": "dummy"
-    }
-};
-var spodb = {
-    "dummy": {
-        "blueprint": "dummy"
-    }
-};
+var facilities = { };
+var spodb = { };
 
 var queued_jobs = {};
 var running_jobs = {};
+var resources = { };
 
 var loadouts = require('./loadouts');
 var loadout_accounting = {};
@@ -143,7 +136,7 @@ app.get('/setup', function(req, res) {
 
             return updateInventory(auth.account, list).then(function() {
                 facilities.forEach(function(f) {
-                    buildFacility(f.uuid, f.blueprint, f.account);
+                    updateFacility(f.uuid, f.blueprint, f.account);
                 });
 
                 loadout_accounting[auth.account] = loadout_name;
@@ -156,22 +149,47 @@ app.get('/setup', function(req, res) {
     }).done();
 });
 
+function hashForEach(obj, fn) {
+    for (var k in obj) {
+        fn(k, obj[k]);
+    }
+}
+
 app.get('/jobs', function(req, res) {
     authorize(req).then(function(auth) {
-        if (auth.privileged && req.param('all') == 'true') {
-            res.send(queued_jobs);
-        } else {
-            var my_jobs = {};
+        var dataset = {};
 
-            for (var key in queued_jobs) {
-                var i = queued_jobs[key];
-                if (i.account == auth.account) {
-                    my_jobs[key] = i;
-                }
+        function initKey(k) {
+            if (dataset[k] === undefined) {
+                dataset[k] = {
+                    queued: []
+                };
             }
-
-            res.send(my_jobs);
         }
+
+        function includeJob(job) {
+            return (job.account == auth.account || (auth.privileged && req.param('all') == 'true'));
+        }
+
+        hashForEach(running_jobs, function(key, job) {
+            initKey(key);
+
+            if (includeJob(job)) {
+                dataset[key].running = job;
+            }
+        });
+
+        hashForEach(queued_jobs, function(key, queue) {
+            initKey(key);
+
+            queue.forEach(function(job) {
+                if (includeJob(job)) {
+                    dataset[key].queued.push(job);
+                }
+            });
+        });
+
+        res.send(dataset);
     });
 });
 
@@ -273,12 +291,22 @@ app.get('/facilities', function(req, res) {
     });
 });
 
-function buildFacility(uuid, blueprint, account) {
+function updateFacility(uuid, blueprint, account) {
+    if (blueprint.production === undefined) {
+        throw new Error(uuid+" is not a production facility");
+    }
+
     facilities[uuid] = {
         blueprint: blueprint.uuid,
         account: account
     };
 
+    if (blueprint.production.generate !== undefined) {
+        resources[uuid] = blueprint.production.generate;
+    }
+
+    // Not every facility is a structure. placeholder
+    // until spodb is external and is the one calling us
     if (blueprint.type == "structure" || blueprint.type == "deployable") {
         spodb[uuid] = {
             blueprint: uuid
@@ -301,6 +329,22 @@ function getInventoryData(uuid, account) {
     });
 }
 
+function destroyFacility(uuid) {
+    var facility = facilities[uuid];
+
+    delete resources[uuid];
+    delete running_jobs[uuid];
+    delete queued_jobs[uuid];
+    delete facilities[uuid];
+}
+
+// When a ship or production structure is destroyed
+app.delete('/facilities/:uuid', function(req, res) {
+    destroyFacility(req.param('uuid'));
+
+    res.sendStatus(204);
+});
+
 // TODO this endpoint should be restricted when spodb
 // starts calling it and users don't have to anymore
 app.post('/facilities/:uuid', function(req, res) {
@@ -317,7 +361,7 @@ app.post('/facilities/:uuid', function(req, res) {
 
         if (blueprint && inventory.blueprint == blueprint.uuid) {
 
-            buildFacility(uuid, blueprint, auth.account);
+            updateFacility(uuid, blueprint, auth.account);
 
             res.sendStatus(201);
         } else {
@@ -414,7 +458,6 @@ function fullfillResources(job) {
         var target = blueprints[job.target];
 
         if (job.action == "refine") {
-            // TODO verify space in the attached inventory after target is removed
             promises.push(consume(job.account, job.facility, job.slice, job.target, job.quantity));
         } else {
             for (var key in target.build.resources) {
@@ -429,51 +472,62 @@ function fullfillResources(job) {
         job.finishAt = (new Date().getTime() + job.duration * 1000 * job.quantity);
         job.resourcesFullfilled = true;
         job.resourcesInProgress = false;
-        console.log("fullfilled "+job.uuid+" at "+job.facility);
+        console.log("fullfilled " + job.uuid + " at " + job.facility);
     }, function(e) {
         job.resourcesInProgress = false;
-        console.log("failed to fullfilled "+job.uuid+" at "+job.facility+": "+e.toString());
+        console.log("failed to fullfilled " + job.uuid + " at " + job.facility + ": " + e.toString());
     });
 }
 
 function startJob(job) {
     if (running_jobs[job.facility] === undefined) {
         running_jobs[job.facility] = job;
-    } else { 
-        throw new Error("failed to start job in "+job.facility+", "+running_jobs[job.facility]+" is already running");
+    } else {
+        throw new Error("failed to start job in " + job.facility + ", " + running_jobs[job.facility] + " is already running");
     }
 
     job.resourcesFullfilled = false;
     job.resourcesInProgress = false;
 
-    console.log("running "+job.uuid+" at "+job.facility);
+    console.log("running " + job.uuid + " at " + job.facility);
 }
 
 function deliverJob(job) {
-    var promises = [];
-
     switch (job.action) {
         case "manufacture":
-            promises.push(produce(job.account, job.facility, job.slice, job.target, job.quantity));
-            break;
+            return produce(job.account, job.facility, job.slice, job.target, job.quantity);
+
         case "refine":
+            var promises = [];
+
             for (var key in job.outputs) {
                 var count = job.outputs[key];
                 // TODO do this as a transaction
                 promises.push(produce(job.account, job.facility, job.slice, key, count * job.quantity));
             }
-            break;
+
+            return Q.all(promises);
         case "construct":
-            // TODO update inventory and our own tracking in addition
-            // to notifying spodb
-            spodb[job.facility].blueprint = job.target;
+            return Q.fcall(function() {
+                // Updating the facility uuid is because everything
+                // is built on a scaffold, so everything starts as a facility
+                spodb[job.facility].blueprint = job.target;
+            }).then(function() {
+                return getBlueprints().then(function(blueprints) {
+                    var blueprint = blueprints[job.target];
 
-            promises.push(updateInventoryContainer(job.facility, job.target, job.account));
-
-            break;
+                    // If a scaffold was upgraded to a non-production
+                    // structure, remove the facility tracking
+                    if (blueprint.production === undefined) {
+                        destroyFacility(job.facility);
+                    } else {
+                        updateFacility(job.facility, blueprint, job.account);
+                    }
+                }).then(function() {
+                    return updateInventoryContainer(job.facility, job.target, job.account);
+                });
+            });
     }
-
-    return Q.all(promises);
 }
 
 function checkAndProcessFacilityJob(facility) {
@@ -484,10 +538,12 @@ function checkAndProcessFacilityJob(facility) {
         if (!job.resourcesInProgress) {
             fullfillResources(job);
         }
-    } else if (job.finishAt < timestamp) {
+    } else if (job.finishAt < timestamp && job.deliveryStartedAt === undefined) {
+        job.deliveryStartedAt = timestamp;
+
         deliverJob(job).then(function() {
             if (running_jobs[facility] !== undefined && running_jobs[facility].uuid == job.uuid) {
-                console.log("delivered "+job.uuid+ " at "+facility);
+                console.log("delivered " + job.uuid + " at " + facility);
                 delete running_jobs[facility];
 
                 var list = queued_jobs[facility];
@@ -497,17 +553,52 @@ function checkAndProcessFacilityJob(facility) {
                     list.splice(0, 1);
                 }
             } else {
-                console.log("unknown job running in "+facility, running_jobs[facility]);
+                console.log("unknown job running in " + facility, running_jobs[facility]);
             }
         }, function(e) {
             console.log("failed to deliver job in " + facility + ": " + e.toString());
+            delete job.deliveryStartedAt;
         }).done();
+    }
+}
+
+function checkAndDeliverResources(uuid) {
+    var resource = resources[uuid];
+    var facility = facilities[uuid];
+    var timestamp = new Date().getTime();
+
+    if (resource.lastDeliveredAt === undefined) {
+        // The first time around this is just a dummy
+        resource.lastDeliveredAt = timestamp;
+    } else if (((resource.lastDeliveredAt + resource.period) < timestamp) && resource.deliveryStartedAt === undefined) {
+        resource.deliveryStartedAt = timestamp;
+        produce(facility.account, uuid, 'default', resource.type, resource.quantity).then(function() {
+            resource.lastDeliveredAt = timestamp;
+            delete resource.deliveryStartedAt;
+        }, function(e) {
+            console.log("failed to deliver resources from "+uuid+": "+e.toString());
+            delete resource.deliveryStartedAt;
+        });
+    } else {
+        if (resource.deliveryStartedAt) {
+            console.log("delivery was started for "+uuid+" and I'm still waiting");
+        } else {
+            console.log(uuid+" is waiting until "+timestamp+" is greater than "+(resource.lastDeliveredAt+resource.period)+ " "+((resource.lastDeliveredAt + resource.period) > timestamp)+" "+(timestamp - resource.lastDeliveredAt));
+        }
     }
 }
 
 var buildWorker = setInterval(function() {
     for (var facility in running_jobs) {
         checkAndProcessFacilityJob(facility);
+    }
+}, 1000);
+
+var resourceWorker = setInterval(function() {
+    console.log('resources', resources);
+
+    for (var facility in resources) {
+        checkAndDeliverResources(facility);
     }
 }, 1000);
 
