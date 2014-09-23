@@ -595,8 +595,6 @@ var buildWorker = setInterval(function() {
 }, 1000);
 
 var resourceWorker = setInterval(function() {
-    console.log('resources', resources);
-
     for (var facility in resources) {
         checkAndDeliverResources(facility);
     }
