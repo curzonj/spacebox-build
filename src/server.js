@@ -8,6 +8,7 @@ var uuidGen = require('node-uuid');
 var debug = require('debug')('build');
 var Q = require('q');
 var qhttp = require("q-io/http");
+var WebSockets = require("ws");
 
 var app = express();
 var port = process.env.PORT || 5000;
@@ -42,9 +43,14 @@ function getAuthToken() {
 }
 
 function authorize(req, restricted) {
-    var auth_header = req.get('Authorization');
+    var auth_header = req.headers.authorization;
+
     if (auth_header === undefined) {
-        throw new Error("not authorized");
+        // We do this so that the Q-promise error handling
+        // will catch it
+        return Q.fcall(function() {
+            throw new Error("not authorized");
+        });
     }
 
     var parts = auth_header.split(' ');
@@ -227,6 +233,7 @@ app.post('/jobs', function(req, res) {
         var canList = facilityType.production[job.action];
         var target = blueprints[job.target];
 
+        // Must wait until we have the auth response to check authorization
         if (facility.account != auth.account) {
             return res.status(401).send("not authorized to access that facility");
         }
@@ -266,7 +273,11 @@ app.post('/jobs', function(req, res) {
             queued_jobs[job.facility].push(job);
         }
 
-        res.sendStatus(201);
+        res.status(201).send({
+            job: {
+                uuid: job.uuid
+            }
+        });
     }).fail(function(e) {
         res.status(500).send(e.toString());
     }).done();
@@ -301,6 +312,13 @@ function updateFacility(uuid, blueprint, account) {
         account: account
     };
 
+    publish({
+        type: 'facility',
+        account: account,
+        uuid: uuid,
+        blueprint: blueprint.uuid,
+    });
+
     if (blueprint.production.generate !== undefined) {
         resources[uuid] = blueprint.production.generate;
     }
@@ -331,6 +349,14 @@ function getInventoryData(uuid, account) {
 
 function destroyFacility(uuid) {
     var facility = facilities[uuid];
+
+    publish({
+        type: 'facility',
+        account: facility.account,
+        tombstone: true,
+        uuid: uuid,
+        blueprint: facility.blueprint,
+    });
 
     delete resources[uuid];
     delete running_jobs[uuid];
@@ -489,6 +515,14 @@ function startJob(job) {
     job.resourcesFullfilled = false;
     job.resourcesInProgress = false;
 
+    publish({
+        type: 'job',
+        account: job.account,
+        uuid: job.uuid,
+        facility: job.facility,
+        state: 'started',
+    });
+
     console.log("running " + job.uuid + " at " + job.facility);
 }
 
@@ -546,6 +580,14 @@ function checkAndProcessFacilityJob(facility) {
                 console.log("delivered " + job.uuid + " at " + facility);
                 delete running_jobs[facility];
 
+                publish({
+                    account: job.account,
+                    type: 'job',
+                    uuid: job.uuid,
+                    facility: job.facility,
+                    state: 'delivered',
+                });
+
                 var list = queued_jobs[facility];
 
                 if (list !== undefined && list.length > 0) {
@@ -602,4 +644,45 @@ var resourceWorker = setInterval(function() {
 
 var server = http.createServer(app);
 server.listen(port);
+
+var WebSocketServer = WebSockets.Server,
+    wss = new WebSocketServer({
+        server: server,
+        verifyClient: function (info, callback) {
+            authorize(info.req).then(function(auth) {
+                info.req.authentication = auth;
+                callback(true);
+            }, function(e) {
+                info.req.authentication = {};
+                callback(false);
+            });
+        }
+    });
+
+var listeners = [];
+wss.on('connection', function(ws) {
+    listeners.push(ws);
+
+    ws.on('close', function() {
+        var i= listeners.indexOf(ws);
+        if (i > -1) {
+            listeners.splice(i, 1);
+        }
+    });
+});
+
+function publish(message) {
+    console.log("publishing to %d listeners", listeners.length, message);
+
+    listeners.forEach(function(ws) {
+        var account = ws.upgradeReq.authentication.account;
+
+        if (ws.readyState == WebSockets.OPEN && message.account == account) {
+            ws.send(JSON.stringify(message));
+        } else {
+            console.log("owner %s !== connection %s", message.account, account);
+        }
+    });
+}
+
 console.log("server ready");
