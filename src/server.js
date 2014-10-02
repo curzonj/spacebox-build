@@ -9,6 +9,7 @@ var debug = require('debug')('build');
 var Q = require('q');
 var qhttp = require("q-io/http");
 var WebSockets = require("ws");
+var C = require('spacebox-common');
 
 var app = express();
 var port = process.env.PORT || 5000;
@@ -18,70 +19,6 @@ app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({
     extended: false
 }));
-
-var auth_token;
-
-function getAuthToken() {
-    return Q.fcall(function() {
-        var now = new Date().getTime();
-
-        if (auth_token !== undefined && auth_token.expires > now) {
-            return auth_token.token;
-        } else {
-            return qhttp.read({
-                url: process.env.AUTH_URL + '/auth?ttl=3600',
-                headers: {
-                    "Content-Type": "application/json",
-                    "Authorization": 'Basic ' + new Buffer(process.env.INTERNAL_CREDS).toString('base64')
-                }
-            }).then(function(b) {
-                auth_token = JSON.parse(b.toString());
-                return auth_token.token;
-            });
-        }
-    });
-}
-
-function authorize(req, restricted) {
-    var auth_header = req.headers.authorization;
-
-    if (auth_header === undefined) {
-        // We do this so that the Q-promise error handling
-        // will catch it
-        return Q.fcall(function() {
-            throw new Error("not authorized");
-        });
-    }
-
-    var parts = auth_header.split(' ');
-
-    // TODO make a way for internal apis to authorize
-    // as a specific account without having to get a
-    // different bearer token for each one. Perhaps
-    // auth will return a certain account if the authorized
-    // token has metadata appended to the end of it
-    // or is fernet encoded.
-    if (parts[0] != "Bearer") {
-        throw new Error("not authorized");
-    }
-
-    // This will fail if it's not authorized
-    return qhttp.read({
-        method: "POST",
-        url: process.env.AUTH_URL + '/token',
-        headers: {
-            "Content-Type": "application/json"
-        },
-        body: [JSON.stringify({
-            token: parts[1],
-            restricted: (restricted === true)
-        })]
-    }).then(function(body) {
-        return JSON.parse(body.toString());
-    }).fail(function(e) {
-        throw new Error("not authorized");
-    });
-}
 
 function getBlueprints() {
     return qhttp.read(process.env.TECHDB_URL + '/blueprints').then(function(b) {
@@ -105,7 +42,7 @@ app.get('/setup', function(req, res) {
     var loadout = loadouts[loadout_name];
 
 
-    Q.spread([getBlueprints(), authorize(req)], function(blueprints, auth) {
+    Q.spread([getBlueprints(), C.authorize_req(req)], function(blueprints, auth) {
         if (loadout_accounting[auth.account] !== undefined) {
             return res.status(200).send("that account is already setup");
         } else if (loadout === undefined) {
@@ -162,7 +99,7 @@ function hashForEach(obj, fn) {
 }
 
 app.get('/jobs', function(req, res) {
-    authorize(req).then(function(auth) {
+    C.authorize_req(req).then(function(auth) {
         var dataset = {};
 
         function initKey(k) {
@@ -228,7 +165,7 @@ app.post('/jobs', function(req, res) {
         return res.status(404).send("no such facility: " + job.facility);
     }
 
-    Q.spread([getBlueprints(), authorize(req)], function(blueprints, auth) {
+    Q.spread([getBlueprints(), C.authorize_req(req)], function(blueprints, auth) {
         var facilityType = blueprints[facility.blueprint];
         var canList = facilityType.production[job.action];
         var target = blueprints[job.target];
@@ -284,7 +221,7 @@ app.post('/jobs', function(req, res) {
 });
 
 app.get('/facilities', function(req, res) {
-    authorize(req).then(function(auth) {
+    C.authorize_req(req).then(function(auth) {
         if (auth.privileged && req.param('all') == 'true') {
             res.send(facilities);
         } else {
@@ -299,7 +236,9 @@ app.get('/facilities', function(req, res) {
 
             res.send(my_facilities);
         }
-    });
+    }).fail(function(e) {
+        res.status(500).send(e.toString());
+    }).done();
 });
 
 function updateFacility(uuid, blueprint, account) {
@@ -333,7 +272,7 @@ function updateFacility(uuid, blueprint, account) {
 }
 
 function getInventoryData(uuid, account) {
-    return getAuthToken().then(function(token) {
+    return C.getAuthToken().then(function(token) {
         return qhttp.read({
             method: "GET",
             url: process.env.INVENTORY_URL + '/inventory/' + uuid,
@@ -374,7 +313,7 @@ app.delete('/facilities/:uuid', function(req, res) {
 // TODO this endpoint should be restricted when spodb
 // starts calling it and users don't have to anymore
 app.post('/facilities/:uuid', function(req, res) {
-    var authP = authorize(req);
+    var authP = C.authorize_req(req);
     var uuid = req.param('uuid');
     var inventoryP = authP.then(function(auth) {
         // This verifies that the inventory exists and
@@ -389,7 +328,11 @@ app.post('/facilities/:uuid', function(req, res) {
 
             updateFacility(uuid, blueprint, auth.account);
 
-            res.sendStatus(201);
+            res.status(201).send({
+                facility: {
+                    uuid: uuid
+                }
+            });
         } else {
             res.status(400).send("no such blueprint");
         }
@@ -400,7 +343,7 @@ app.post('/facilities/:uuid', function(req, res) {
 
 // this is just a stub until we build the spodb
 app.get('/spodb', function(req, res) {
-    authorize(req, true).then(function(auth) {
+    C.authorize_req(req, true).then(function(auth) {
         res.send(spodb);
     });
 });
@@ -413,7 +356,7 @@ function updateInventory(account, data) {
         quantity: quantity
     }]
     */
-    return getAuthToken().then(function(token) {
+    return C.getAuthToken().then(function(token) {
         return qhttp.request({
             method: "POST",
             url: process.env.INVENTORY_URL + '/inventory',
@@ -453,7 +396,7 @@ function produce(account, uuid, slice, type, quantity) {
 }
 
 function updateInventoryContainer(uuid, blueprint, account) {
-    return getAuthToken().then(function(token) {
+    return C.getAuthToken().then(function(token) {
         return qhttp.request({
             method: "POST",
             url: process.env.INVENTORY_URL + '/containers/' + uuid,
@@ -649,7 +592,7 @@ var WebSocketServer = WebSockets.Server,
     wss = new WebSocketServer({
         server: server,
         verifyClient: function (info, callback) {
-            authorize(info.req).then(function(auth) {
+            C.authorize_req(info.req).then(function(auth) {
                 info.req.authentication = auth;
                 callback(true);
             }, function(e) {
