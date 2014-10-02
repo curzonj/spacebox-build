@@ -558,9 +558,28 @@ function checkAndDeliverResources(uuid) {
     } else if (((resource.lastDeliveredAt + resource.period) < timestamp) && resource.deliveryStartedAt === undefined) {
         resource.deliveryStartedAt = timestamp;
         produce(facility.account, uuid, 'default', resource.type, resource.quantity).then(function() {
+
+            publish({
+                type: 'resources',
+                account: facility.account,
+                facility: uuid,
+                blueprint: resource.type,
+                quantity: resource.quantity,
+                state: 'delivered'
+            });
+
             resource.lastDeliveredAt = timestamp;
             delete resource.deliveryStartedAt;
         }, function(e) {
+            publish({
+                type: 'resources',
+                account: facility.account,
+                facility: uuid,
+                blueprint: resource.type,
+                quantity: resource.quantity,
+                state: 'delivery_failed'
+            });
+
             console.log("failed to deliver resources from "+uuid+": "+e.toString());
             delete resource.deliveryStartedAt;
         });
