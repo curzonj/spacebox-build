@@ -20,12 +20,6 @@ app.use(bodyParser.urlencoded({
     extended: false
 }));
 
-function getBlueprints() {
-    return qhttp.read(process.env.TECHDB_URL + '/blueprints').then(function(b) {
-        return JSON.parse(b.toString());
-    });
-}
-
 var facilities = { };
 var spodb = { };
 
@@ -42,7 +36,7 @@ app.get('/setup', function(req, res) {
     var loadout = loadouts[loadout_name];
 
 
-    Q.spread([getBlueprints(), C.authorize_req(req)], function(blueprints, auth) {
+    Q.spread([C.getBlueprints(), C.authorize_req(req)], function(blueprints, auth) {
         if (loadout_accounting[auth.account] !== undefined) {
             return res.status(200).send("that account is already setup");
         } else if (loadout === undefined) {
@@ -77,7 +71,7 @@ app.get('/setup', function(req, res) {
                 }
             }
 
-            return updateInventory(auth.account, list).then(function() {
+            return C.updateInventory(auth.account, list).then(function() {
                 facilities.forEach(function(f) {
                     updateFacility(f.uuid, f.blueprint, f.account);
                 });
@@ -165,7 +159,7 @@ app.post('/jobs', function(req, res) {
         return res.status(404).send("no such facility: " + job.facility);
     }
 
-    Q.spread([getBlueprints(), C.authorize_req(req)], function(blueprints, auth) {
+    Q.spread([C.getBlueprints(), C.authorize_req(req)], function(blueprints, auth) {
         var facilityType = blueprints[facility.blueprint];
         var canList = facilityType.production[job.action];
         var target = blueprints[job.target];
@@ -321,7 +315,7 @@ app.post('/facilities/:uuid', function(req, res) {
         return getInventoryData(uuid, auth.account);
     });
 
-    Q.spread([getBlueprints(), authP, inventoryP], function(blueprints, auth, inventory) {
+    Q.spread([C.getBlueprints(), authP, inventoryP], function(blueprints, auth, inventory) {
         var blueprint = blueprints[req.body.blueprint];
 
         if (blueprint && inventory.blueprint == blueprint.uuid) {
@@ -348,37 +342,8 @@ app.get('/spodb', function(req, res) {
     });
 });
 
-function updateInventory(account, data) {
-    /* data = [{
-        inventory: uuid,
-        slice: slice,
-        blueprint: type,
-        quantity: quantity
-    }]
-    */
-    return C.getAuthToken().then(function(token) {
-        return qhttp.request({
-            method: "POST",
-            url: process.env.INVENTORY_URL + '/inventory',
-            headers: {
-                "Authorization": "Bearer " + token + '/' + account,
-                "Content-Type": "application/json"
-            },
-            body: [JSON.stringify(data)]
-        }).then(function(resp) {
-            if (resp.status !== 204) {
-                resp.body.read().then(function(b) {
-                    console.log("inventory " + resp.status + " reason: " + b.toString());
-                }).done();
-
-                throw new Error("inventory responded with " + resp.status);
-            }
-        });
-    });
-}
-
 function consume(account, uuid, slice, type, quantity) {
-    return updateInventory(account, [{
+    return C.updateInventory(account, [{
         inventory: uuid,
         slice: slice,
         blueprint: type,
@@ -387,7 +352,7 @@ function consume(account, uuid, slice, type, quantity) {
 }
 
 function produce(account, uuid, slice, type, quantity) {
-    return updateInventory(account, [{
+    return C.updateInventory(account, [{
         inventory: uuid,
         slice: slice,
         blueprint: type,
@@ -422,7 +387,7 @@ function updateInventoryContainer(uuid, blueprint, account) {
 function fullfillResources(job) {
     job.resourcesInProgress = true;
 
-    return getBlueprints().then(function(blueprints) {
+    return C.getBlueprints().then(function(blueprints) {
         var promises = [];
         var target = blueprints[job.target];
 
@@ -490,7 +455,7 @@ function deliverJob(job) {
                 // is built on a scaffold, so everything starts as a facility
                 spodb[job.facility].blueprint = job.target;
             }).then(function() {
-                return getBlueprints().then(function(blueprints) {
+                return C.getBlueprints().then(function(blueprints) {
                     var blueprint = blueprints[job.target];
 
                     // If a scaffold was upgraded to a non-production
