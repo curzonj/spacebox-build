@@ -27,67 +27,6 @@ var queued_jobs = {};
 var running_jobs = {};
 var resources = { };
 
-var loadouts = require('./loadouts');
-var loadout_accounting = {};
-
-// TODO normally spodb would do this when an account first connects
-app.post('/setup', function(req, res) {
-    var loadout_name = req.param('loadout');
-    var loadout = loadouts[loadout_name];
-
-
-    Q.spread([C.getBlueprints(), C.authorize_req(req)], function(blueprints, auth) {
-        if (loadout_accounting[auth.account] !== undefined) {
-            return res.status(200).send("that account is already setup");
-        } else if (loadout === undefined) {
-            return res.status(404).send("no such loadout available: "+loadout_name);
-        } else {
-            var list = [];
-            var facilities = [];
-
-            for (var ctype in loadout) {
-                var uuid = uuidGen.v1();
-                list.push({
-                    container_action: "create",
-                    uuid: uuid,
-                    blueprint: ctype
-                });
-
-                if (blueprints[ctype].production !== undefined) {
-                    facilities.push({
-                        uuid: uuid,
-                        blueprint: blueprints[ctype],
-                        account: auth.account
-                    });
-                }
-
-                for (var type in loadout[ctype]) {
-                    list.push({
-                        inventory: uuid,
-                        slice: "default",
-                        blueprint: type,
-                        quantity: loadout[ctype][type]
-                    });
-                }
-            }
-
-            return C.updateInventory(auth.account, list).then(function() {
-                facilities.forEach(function(f) {
-                    updateFacility(f.uuid, f.blueprint, f.account);
-                });
-
-                loadout_accounting[auth.account] = loadout_name;
-
-                res.status(200).send("account setup with " + loadout_name);
-            });
-        }
-    }).fail(function(e) {
-        console.log(e);
-        console.log(e.stack);
-        res.status(500).send(e.toString());
-    }).done();
-});
-
 function hashForEach(obj, fn) {
     for (var k in obj) {
         fn(k, obj[k]);
