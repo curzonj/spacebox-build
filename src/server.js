@@ -31,7 +31,7 @@ var loadouts = require('./loadouts');
 var loadout_accounting = {};
 
 // TODO normally spodb would do this when an account first connects
-app.get('/setup', function(req, res) {
+app.post('/setup', function(req, res) {
     var loadout_name = req.param('loadout');
     var loadout = loadouts[loadout_name];
 
@@ -40,7 +40,7 @@ app.get('/setup', function(req, res) {
         if (loadout_accounting[auth.account] !== undefined) {
             return res.status(200).send("that account is already setup");
         } else if (loadout === undefined) {
-            return res.status(404).send("no such loadout available");
+            return res.status(404).send("no such loadout available: "+loadout_name);
         } else {
             var list = [];
             var facilities = [];
@@ -82,6 +82,8 @@ app.get('/setup', function(req, res) {
             });
         }
     }).fail(function(e) {
+        console.log(e);
+        console.log(e.stack);
         res.status(500).send(e.toString());
     }).done();
 });
