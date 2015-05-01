@@ -1,26 +1,25 @@
 'use strict';
 
-var http = require("http");
-var express = require("express");
-var logger = require('morgan');
-var bodyParser = require('body-parser');
-var uuidGen = require('node-uuid');
-var debug = require('debug')('build');
-var Q = require('q');
-var qhttp = require("q-io/http");
-var WebSockets = require("ws");
-var C = require('spacebox-common');
+var http = require("http"),
+    express = require("express"),
+    logger = require('morgan'),
+    bodyParser = require('body-parser'),
+    uuidGen = require('node-uuid'),
+    moment = require('moment'),
+    npm_debug = require('debug'),
+    log = npm_debug('build:info'),
+    error = npm_debug('build:error'),
+    debug = npm_debug('build:debug'),
+    Q = require('q'),
+    qhttp = require("q-io/http"),
+    WebSockets = require("ws"),
+    C = require('spacebox-common');
 
-var pgpLib = require('pg-promise');
-var pgp = pgpLib(/*options*/);
-var database_url = process.env.DATABASE_URL || process.env.BUILD_DATABASE_URL;
-var db = pgp(database_url);
-
+C.db.select('build');
+Q.longStackSupport = true;
 
 var app = express();
 var port = process.env.PORT || 5000;
-
-Q.longStackSupport = true;
 
 app.use(logger('dev'));
 app.use(bodyParser.json());
@@ -30,35 +29,35 @@ app.use(bodyParser.urlencoded({
 
 var listeners = [];
 
-var spodb = { };
-
 var dao = {
     facilities: {
         all: function(account) {
             if (account === undefined) {
-                return db.query("select * from facilities");
+                return C.db.exec('select * from facilities');
             } else {
-                return db.query("select * from facilities where account=$1", [ account ]);
+                return C.db.exec('select * from facilities', [ account ]);
             }
         },
+        needAttention: function() {
+            return C.db.exec('select * from facilities where trigger_at is null or trigger_at < $1', [ new Date() ]);
+        },
         upsert: function(uuid, doc) {
-            return db.
-                query("update facilities set blueprint = $2, account = $3, resources = $4 where id =$1 returning id", [ uuid, doc.blueprint, doc.account, doc.resources ]).
+            return C.db.exec('update facilities set blueprint = $2, account = $3, resources = $4 where id =$1 returning id', [ uuid, doc.blueprint, doc.account, doc.resources ]).
                 then(function(data) {
-                    console.log(data);
+                    debug(data);
                     if (data.length === 0) {
-                        return db.
-                            query("insert into facilities (id, blueprint, account, resources) values ($1, $2, $3, $4)", [ uuid, doc.blueprint, doc.account, doc.resources ]);
+                        return C.db.
+                            exec('insert into facilities (id, blueprint, account, resources) values ($1, $2, $3, $4)', [ uuid, doc.blueprint, doc.account, doc.resources ]);
                     }
                 });
         },
         destroy: function(uuid) {
-            return db.
-                query("delete from facilities where id =$1", [ uuid ]);
+            return C.db.
+                exec("delete from facilities where id=$1", [ uuid ]);
         },
         get: function(uuid) {
-            return db.
-                query("select * from facilities where id=$1", [ uuid ]).
+            return C.db.
+                exec("select * from facilities where id=$1", [ uuid ]).
                 then(function(data) {
                     return data[0];
                 });
@@ -68,37 +67,37 @@ var dao = {
     jobs: {
         all: function(account) {
             if (account === undefined) {
-                return db.query("select * from jobs");
+                return C.db.exec("select * from jobs");
             } else {
-                return db.query("select * from jobs where account=$1", [ account ]);
+                return C.db.exec("select * from jobs where account=$1", [ account ]);
             }
         },
         get: function(uuid, account) {
-            return db.
-                query("select * from jobs where id=$1 and account=$1", [ uuid, account ]).
+            return C.db.
+                exec("select * from jobs where id=$1 and account=$1", [ uuid, account ]).
                 then(function(data) {
                     return data[0];
                 });
         },
         queue: function(doc) {
-            return db.
-                query("insert into jobs (id, facility_id, account, doc, status, statusCompletedAt, createdAt) values ($1, $2, $3, $4, $5, $6, $7)", [ doc.uuid, doc.facility, doc.account, doc, "queued", new Date(), new Date() ]);
+            return C.db.
+                exec("insert into jobs (id, facility_id, account, doc, status, statusCompletedAt, createdAt) values ($1, $2, $3, $4, $5, $6, $7)", [ doc.uuid, doc.facility, doc.account, doc, "queued", new Date(), new Date() ]);
         
         },
         nextJob: function(facility_id) {
-            return db.
-                query("select * from jobs where facility_id = $1 and status != 'delivered' and next_status is null order by createdAt limit 1", [ facility_id ]).
+            return C.db.
+                exec("select * from jobs where facility_id = $1 and status != 'delivered' and next_status is null order by createdAt limit 1", [ facility_id ]).
                 then(function(data) {
                     return data[0];
                 });
         },
         destroy: function(uuid) {
-            return db.
-                query("delete from jobs where id =$1", [ uuid ]);
+            return C.db.
+                exec("delete from jobs where id =$1", [ uuid ]);
         },
         flagNextStatus: function(uuid, status) {
-            return db.
-                query("update jobs set next_status = $2, nextStatusStartedAt = $3 where nextStatusStartedAt is null and id = $1 returning id", [ uuid, status, new Date() ]).
+            return C.db.
+                exec("update jobs set next_status = $2, nextStatusStartedAt = $3 where nextStatusStartedAt is null and id = $1 returning id", [ uuid, status, new Date() ]).
                 then(function(data) {
                     if (data.length === 0) {
                         throw("failed to lock job "+uuid+" for "+status);
@@ -106,8 +105,8 @@ var dao = {
                 });
         },
         completeStatus: function(uuid, status, doc) {
-            return db.
-                query("update jobs set status = next_status, statusCompletedAt = $3, next_status = null, nextStatusStartedAt = null, doc = $4 where id = $1 and next_status = $2 returning id", [ uuid, status, new Date(), doc ]).
+            return C.db.
+                exec("update jobs set status = next_status, statusCompletedAt = $3, next_status = null, nextStatusStartedAt = null, doc = $4 where id = $1 and next_status = $2 returning id", [ uuid, status, new Date(), doc ]).
                 then(function(data) {
                     if (data.length === 0) {
                         throw("failed to transition job "+uuid+" to "+status);
@@ -115,8 +114,8 @@ var dao = {
                 });
         },
         failNextStatus: function(uuid, status) {
-            return db.
-                query("update jobs set next_status = null, nextStatusStartedAt = null, where id = $1 and next_status = $2 returning id", [ uuid, status ]).
+            return C.db.
+                exec("update jobs set next_status = null, nextStatusStartedAt = null, where id = $1 and next_status = $2 returning id", [ uuid, status ]).
                 then(function(data) {
                     if (data.length === 0) {
                         throw("failed to fail job transition "+uuid+" to "+status);
@@ -170,7 +169,7 @@ app.delete('/jobs/:uuid', function(req, res) {
 
 // players queue jobs
 app.post('/jobs', function(req, res) {
-    console.log(req.body);
+    debug(req.body);
 
     var job = req.body;
     var duration = -1;
@@ -194,8 +193,8 @@ app.post('/jobs', function(req, res) {
         if (canList === undefined || !canList.some(function(e) {
             return e.item == job.target;
         })) {
-            console.log(canList);
-            console.log(job.target);
+            debug(canList);
+            debug(job.target);
 
             return res.status(400).send("facility is unable to produce that");
         }
@@ -221,11 +220,7 @@ app.post('/jobs', function(req, res) {
                 }
             });
         });
-    }).fail(function(e) {
-        console.log(e);
-        console.log(e.stack);
-        res.status(500).send(e.toString());
-    }).done();
+    }).fail(C.http.errHandler(req, res, error)).done();
 });
 
 app.get('/facilities', function(req, res) {
@@ -237,11 +232,7 @@ app.get('/facilities', function(req, res) {
         }
     }).then(function(list) {
         res.send(list);
-    }).fail(function(e) {
-        console.log(e);
-        console.log(e.stack);
-        res.status(500).send(e.toString());
-    }).done();
+    }).fail(C.http.errHandler(req, res, error)).done();
 });
 
 function updateFacility(uuid, blueprint, account) {
@@ -260,14 +251,6 @@ function updateFacility(uuid, blueprint, account) {
             uuid: uuid,
             blueprint: blueprint.uuid,
         });
-
-        // Not every facility is a structure. placeholder
-        // until spodb is external and is the one calling us
-        if (blueprint.type == "structure" || blueprint.type == "deployable") {
-            spodb[uuid] = {
-                blueprint: uuid
-            };
-        }
     });
 }
 
@@ -307,11 +290,7 @@ function destroyFacility(uuid) {
 app.delete('/facilities/:uuid', function(req, res) {
     destroyFacility(req.param('uuid')).then(function() {
         res.sendStatus(204);
-    }).fail(function(e) {
-        console.log(e);
-        console.log(e.stack);
-        res.status(500).send(e.toString());
-    }).done();
+    }).fail(C.http.errHandler(req, res, error)).done();
 
 });
 
@@ -340,18 +319,7 @@ app.post('/facilities/:uuid', function(req, res) {
         } else {
             res.status(400).send("no such blueprint");
         }
-    }).fail(function(e) {
-        console.log(e);
-        console.log(e.stack);
-        res.status(500).send(e.toString());
-    }).done();
-});
-
-// this is just a stub until we build the spodb
-app.get('/spodb', function(req, res) {
-    C.authorize_req(req, true).then(function(auth) {
-        res.send(spodb);
-    });
+    }).fail(C.http.errHandler(req, res, error)).done();
 });
 
 function consume(account, uuid, slice, type, quantity) {
@@ -369,7 +337,7 @@ function produce(account, uuid, slice, type, quantity) {
         slice: slice,
         blueprint: type,
         quantity: quantity
-    }]);
+    }]).tap(C.qDebug('produce'));
 }
 
 function updateInventoryContainer(uuid, blueprint, account) {
@@ -387,7 +355,7 @@ function updateInventoryContainer(uuid, blueprint, account) {
         }).then(function(resp) {
             if (resp.status !== 204) {
                 resp.body.read().then(function(b) {
-                    console.log("inventory " + resp.status + " reason: " + b.toString());
+                    error("inventory " + resp.status + " reason: " + b.toString());
                 }).done();
 
                 throw new Error("inventory responded with " + resp.status);
@@ -413,13 +381,13 @@ function fullfillResources(data) {
             state: 'started',
         });
 
-        console.log("running " + job.uuid + " at " + job.facility);
+        log("running " + job.uuid + " at " + job.facility);
 
         if (job.action == "refine") {
             return consume(job.account, job.facility, job.slice, job.target, job.quantity);
         } else {
             var promises = [];
-            console.log(target);
+            debug(target);
 
             for (var key in target.build.resources) {
                 var count = target.build.resources[key];
@@ -430,19 +398,22 @@ function fullfillResources(data) {
             return Q.all(promises);
         }
     }).then(function() {
-        job.finishAt = (new Date().getTime() + job.duration * 1000 * job.quantity);
+        var now = new Date();
+        var timestamp = now.getTime() + (now.getTimezoneOffset() * 60000);
+
+        job.finishAt = (timestamp + job.duration * 1000 * job.quantity);
         return dao.jobs.completeStatus(data.id, "resourcesFullfilled", job);
     }).then(function() {
-        console.log("fullfilled " + job.uuid + " at " + job.facility);
+        log("fullfilled " + job.uuid + " at " + job.facility);
     }).fail(function(e) {
-        console.log("failed to fullfill " + job.uuid + " at " + job.facility + ": " + e.toString());
-        console.log(e.stack);
+        error("failed to fullfill " + job.uuid + " at " + job.facility + ": " + e.toString());
+        error(e.stack);
         return dao.jobs.failNextStatus(data.id, "resourcesFullfilled");
     }).done();
 }
 
 function publish(message) {
-    console.log("publishing to %d listeners", listeners.length, message);
+    log("publishing to %d listeners", listeners.length, message);
 
     listeners.forEach(function(ws) {
         var account = ws.upgradeReq.authentication.account;
@@ -450,7 +421,7 @@ function publish(message) {
         if (ws.readyState == WebSockets.OPEN && message.account == account) {
             ws.send(JSON.stringify(message));
         } else {
-            console.log("owner %s !== connection %s", message.account, account);
+            error("owner %s !== connection %s", message.account, account);
         }
     });
 }
@@ -474,7 +445,8 @@ function deliverJob(job) {
             return Q.fcall(function() {
                 // Updating the facility uuid is because everything
                 // is built on a scaffold, so everything starts as a facility
-                spodb[job.facility].blueprint = job.target;
+                return C.request('3dsim', 'POST', 204, '/spodb/'+job.facility, {
+                    blueprint: job.target });
             }).then(function() {
                 return C.getBlueprints().then(function(blueprints) {
                     var blueprint = blueprints[job.target];
@@ -482,9 +454,9 @@ function deliverJob(job) {
                     // If a scaffold was upgraded to a non-production
                     // structure, remove the facility tracking
                     if (blueprint.production === undefined) {
-                        destroyFacility(job.facility);
+                        return destroyFacility(job.facility);
                     } else {
-                        updateFacility(job.facility, blueprint, job.account);
+                        return updateFacility(job.facility, blueprint, job.account);
                     }
                 }).then(function() {
                     return updateInventoryContainer(job.facility, job.target, job.account);
@@ -497,7 +469,10 @@ function jobDeliveryHandling(data) {
     var job = data.doc;
     var facility = data.facility_id;
 
-    if (job.finishAt > new Date().getTime())
+    var now = new Date();
+    var timestamp = now.getTime() + (now.getTimezoneOffset() * 60000);
+
+    if (job.finishAt > timestamp)
         return;
 
     return dao.jobs.flagNextStatus(data.id, "delivered").
@@ -506,7 +481,7 @@ function jobDeliveryHandling(data) {
         }).then(function() {
             return dao.jobs.completeStatus(data.id, "delivered", job);
         }).then(function() {
-            console.log("delivered " + job.uuid + " at " + facility);
+            log("delivered " + job.uuid + " at " + facility);
 
             publish({
                 account: job.account,
@@ -516,7 +491,7 @@ function jobDeliveryHandling(data) {
                 state: 'delivered',
             });
         }, function(e) {
-            console.log("failed to deliver job in " + facility + ": " + e.toString());
+            error("failed to deliver job in " + facility + ": " + e.toString());
             delete job.deliveryStartedAt;
         });
 }
@@ -524,11 +499,11 @@ function jobDeliveryHandling(data) {
 function checkAndProcessFacilityJob(facility) {
     return dao.jobs.nextJob(facility.id).then(function(data) {
         if (data === undefined) {
-            console.log("no matching jobs");
+            log("no matching jobs in "+facility.id);
             return;
         
         } else {
-            console.log(data);
+            debug(data);
         }
 
         switch(data.status) {
@@ -544,17 +519,23 @@ function checkAndProcessFacilityJob(facility) {
 
 function checkAndDeliverResources(facility) {
     var uuid = facility.id;
-    var timestamp = new Date().getTime();
+    var now = new Date();
+    var timestamp = now.getTime() + (now.getTimezoneOffset() * 60000);
+
+    debug('resource processing', facility);
 
     var resource = facility.resources;
 
-    if (facility.resourcesLastDeliveredAt === null) {
+    if (facility.resourceslastdeliveredat === null) {
         // The first time around this is just a dummy
-        return db.query("update facilities set resourceDeliveryStartedAt = null, resourcesLastDeliveredAt = $? where id = $1", [ uuid, new Date() ]);
-    } else if (((facility.resourcesLastDeliveredAt.getTime() + resource.period) < timestamp) && facility.resourceDeliveryStartedAt === undefined) {
-        db.query("update facilities set resourceDeliveryStartedAt = $2 where id = $1", [ uuid, new Date() ]).then(function() {
+        return Q(C.db.exec("update facilities set resourcedeliverystartedat = null, resourceslastdeliveredat = $2 where id = $1", [ uuid, new Date() ]));
+    } else if (
+        moment(facility.resourceslastdeliveredat).add(resource.period, 's').isBefore(moment()) &&
+            facility.resourcedeliverystartedat === null
+    ) {
+        return Q(C.db.exec("update facilities set resourcedeliverystartedat = $2 where id = $1", [ uuid, new Date() ])).then(function() {
             return produce(facility.account, uuid, 'default', resource.type, resource.quantity);
-        }).then(function() {
+        }).tap(C.qDebug('checkAndDeliver')).then(function() {
             publish({
                 type: 'resources',
                 account: facility.account,
@@ -564,8 +545,11 @@ function checkAndDeliverResources(facility) {
                 state: 'delivered'
             });
 
-            return db.query("update facilities set resourceDeliveryStartedAt = null, resourcesLastDeliveredAt = $? where id = $1", [ uuid, new Date() ]);
+            return C.db.exec("update facilities set resourcedeliverystartedat = null, next_backoff = 1, resourceslastdeliveredat = $2, trigger_at = $3 where id = $1",
+                            [ uuid, new Date(), moment().add(resource.period, 's').toDate() ]);
         }).fail(function(e) {
+            error("failed to deliver resources from "+uuid+": "+e.toString());
+
             publish({
                 type: 'resources',
                 account: facility.account,
@@ -575,37 +559,42 @@ function checkAndDeliverResources(facility) {
                 state: 'delivery_failed'
             });
 
-            console.log("failed to deliver resources from "+uuid+": "+e.toString());
-            return db.query("update facilities set resourceDeliveryStartedAt = null where id = $1", [ uuid ]);
-        }).done();
+            return C.db.exec("update facilities set resourcedeliverystartedat = null, next_backoff = $2 where id = $1",
+                            [ uuid, facility.next_backoff * 2, moment(facility.trigger_at).add(facility.next_backoff, 's').toDate() ]);
+        });
     } else {
-        if (facility.resourceDeliveryStartedAt) {
-            console.log("delivery was started for "+uuid+" and I'm still waiting");
+        if (facility.resourcedeliverystartedat) {
+            log("delivery was started for "+uuid+" and I'm still waiting");
         } else {
-            console.log(uuid+" is waiting until "+timestamp+" is greater than "+(facility.resourcesLastDeliveredAt.getTime()+resource.period)+ " "+((facility.resourcesLastDeliveredAt.getTime() + resource.period) > timestamp)+" "+(timestamp - facility.resourcesLastDeliveredAt));
+            log(
+                uuid+" is waiting until "+timestamp+" is greater than "+(facility.resourceslastdeliveredat.getTime()+resource.period),
+                ((facility.resourceslastdeliveredat.getTime() + resource.period) > timestamp),
+                (facility.resourceslastdeliveredat.getTime() - timestamp));
         }
     }
 
-    return Q(null); // jshint ignore:line
+    return Q(null);
 }
 
 var buildWorker = setInterval(function() {
-    console.log("processing jobs");
+    log("processing jobs");
 
-    dao.facilities.all().then(function(data) {
-        console.log('data', data);
-        for (var i in data) {
+    // TODO use an iterator
+    dao.facilities.needAttention().then(function(data) {
+        debug('data', data);
+
+        return Object.keys(data).map(function(i) {
             var facility = data[i];
 
-            console.log('facility', facility);
+            debug('facility', facility);
 
             if (facility.resources === null) {
-                checkAndProcessFacilityJob(facility).done();
+                return checkAndProcessFacilityJob(facility);
             } else {
-                checkAndDeliverResources(facility).done();
+                return checkAndDeliverResources(facility);
             }
-        }
-    });
+        });
+    }).all().done();
 }, 1000); // TODO don't let runs overlap
 
 var server = http.createServer(app);

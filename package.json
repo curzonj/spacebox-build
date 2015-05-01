@@ -11,8 +11,9 @@
     "body-parser": "~1.8.1",
     "debug": "~2.0.0",
     "ws": "latest",
-    "q": "~1",
-    "q-io": "~1",
+    "q": "~1.3.0",
+    "q-io": "~1.12.0",
+    "moment": "latest",
     "pg": "latest",
     "pg-promise": "latest",
     "postgrator": "latest",
@@ -20,6 +21,7 @@
     "express": "latest"
   },
   "jshintConfig": {
-    "node": true
+    "node": true,
+    "newcap": false
   }
 }
