@@ -11,8 +11,16 @@ var qhttp = require("q-io/http");
 var WebSockets = require("ws");
 var C = require('spacebox-common');
 
+var pgpLib = require('pg-promise');
+var pgp = pgpLib(/*options*/);
+var database_url = process.env.DATABASE_URL || process.env.BUILD_DATABASE_URL;
+var db = pgp(database_url);
+
+
 var app = express();
 var port = process.env.PORT || 5000;
+
+Q.longStackSupport = true;
 
 app.use(logger('dev'));
 app.use(bodyParser.json());
@@ -20,12 +28,103 @@ app.use(bodyParser.urlencoded({
     extended: false
 }));
 
-var facilities = { };
+var listeners = [];
+
 var spodb = { };
 
-var queued_jobs = {};
-var running_jobs = {};
-var resources = { };
+var dao = {
+    facilities: {
+        all: function(account) {
+            if (account === undefined) {
+                return db.query("select * from facilities");
+            } else {
+                return db.query("select * from facilities where account=$1", [ account ]);
+            }
+        },
+        upsert: function(uuid, doc) {
+            return db.
+                query("update facilities set blueprint = $2, account = $3, resources = $4 where id =$1 returning id", [ uuid, doc.blueprint, doc.account, doc.resources ]).
+                then(function(data) {
+                    console.log(data);
+                    if (data.length === 0) {
+                        return db.
+                            query("insert into facilities (id, blueprint, account, resources) values ($1, $2, $3, $4)", [ uuid, doc.blueprint, doc.account, doc.resources ]);
+                    }
+                });
+        },
+        destroy: function(uuid) {
+            return db.
+                query("delete from facilities where id =$1", [ uuid ]);
+        },
+        get: function(uuid) {
+            return db.
+                query("select * from facilities where id=$1", [ uuid ]).
+                then(function(data) {
+                    return data[0];
+                });
+        }
+    
+    },
+    jobs: {
+        all: function(account) {
+            if (account === undefined) {
+                return db.query("select * from jobs");
+            } else {
+                return db.query("select * from jobs where account=$1", [ account ]);
+            }
+        },
+        get: function(uuid, account) {
+            return db.
+                query("select * from jobs where id=$1 and account=$1", [ uuid, account ]).
+                then(function(data) {
+                    return data[0];
+                });
+        },
+        queue: function(doc) {
+            return db.
+                query("insert into jobs (id, facility_id, account, doc, status, statusCompletedAt, createdAt) values ($1, $2, $3, $4, $5, $6, $7)", [ doc.uuid, doc.facility, doc.account, doc, "queued", new Date(), new Date() ]);
+        
+        },
+        nextJob: function(facility_id) {
+            return db.
+                query("select * from jobs where facility_id = $1 and status != 'delivered' and next_status is null order by createdAt limit 1", [ facility_id ]).
+                then(function(data) {
+                    return data[0];
+                });
+        },
+        destroy: function(uuid) {
+            return db.
+                query("delete from jobs where id =$1", [ uuid ]);
+        },
+        flagNextStatus: function(uuid, status) {
+            return db.
+                query("update jobs set next_status = $2, nextStatusStartedAt = $3 where nextStatusStartedAt is null and id = $1 returning id", [ uuid, status, new Date() ]).
+                then(function(data) {
+                    if (data.length === 0) {
+                        throw("failed to lock job "+uuid+" for "+status);
+                    }
+                });
+        },
+        completeStatus: function(uuid, status, doc) {
+            return db.
+                query("update jobs set status = next_status, statusCompletedAt = $3, next_status = null, nextStatusStartedAt = null, doc = $4 where id = $1 and next_status = $2 returning id", [ uuid, status, new Date(), doc ]).
+                then(function(data) {
+                    if (data.length === 0) {
+                        throw("failed to transition job "+uuid+" to "+status);
+                    }
+                });
+        },
+        failNextStatus: function(uuid, status) {
+            return db.
+                query("update jobs set next_status = null, nextStatusStartedAt = null, where id = $1 and next_status = $2 returning id", [ uuid, status ]).
+                then(function(data) {
+                    if (data.length === 0) {
+                        throw("failed to fail job transition "+uuid+" to "+status);
+                    }
+                });
+        }
+    }
+};
 
 function hashForEach(obj, fn) {
     for (var k in obj) {
@@ -33,41 +132,32 @@ function hashForEach(obj, fn) {
     }
 }
 
+app.get('/jobs/:uuid', function(req, res) {
+    C.authorize_req(req).then(function(auth) {
+        dao.jobs.get(req.param('uuid'), auth.account).
+            then(function(data) {
+                res.send(data);
+            });
+    });
+});
+
 app.get('/jobs', function(req, res) {
     C.authorize_req(req).then(function(auth) {
-        var dataset = {};
-
-        function initKey(k) {
-            if (dataset[k] === undefined) {
-                dataset[k] = {
-                    queued: []
-                };
-            }
-        }
-
-        function includeJob(job) {
-            return (job.account == auth.account || (auth.privileged && req.param('all') == 'true'));
-        }
-
-        hashForEach(running_jobs, function(key, job) {
-            initKey(key);
-
-            if (includeJob(job)) {
-                dataset[key].running = job;
-            }
-        });
-
-        hashForEach(queued_jobs, function(key, queue) {
-            initKey(key);
-
-            queue.forEach(function(job) {
-                if (includeJob(job)) {
-                    dataset[key].queued.push(job);
-                }
+        dao.jobs.
+            all(auth.privileged && req.param('all') == 'true' ? undefined : auth.account).
+            then(function(data) {
+                res.send(data);
             });
-        });
+    });
+});
 
-        res.send(dataset);
+app.get('/jobs', function(req, res) {
+    C.authorize_req(req).then(function(auth) {
+        dao.jobs.
+            all(auth.privileged && req.param('all') == 'true' ? undefined : auth.account).
+            then(function(data) {
+                res.send(data);
+            });
     });
 });
 
@@ -80,27 +170,18 @@ app.delete('/jobs/:uuid', function(req, res) {
 
 // players queue jobs
 app.post('/jobs', function(req, res) {
-    debug(req.body);
-
-    var example = {
-        "facility": "uuid",
-        "action": "manufacture", // refine, construct
-        "quantity": 3,
-        "target": "blueprintuuid",
-        "inventory": "uuid"
-    };
+    console.log(req.body);
 
     var job = req.body;
-    var facility = facilities[job.facility];
     var duration = -1;
 
     job.uuid = uuidGen.v1();
 
-    if (facility === undefined) {
-        return res.status(404).send("no such facility: " + job.facility);
-    }
+    Q.spread([C.getBlueprints(), C.authorize_req(req), dao.facilities.get(job.facility)], function(blueprints, auth, facility) {
+        if (facility === undefined) {
+            return res.status(404).send("no such facility: " + job.facility);
+        }
 
-    Q.spread([C.getBlueprints(), C.authorize_req(req)], function(blueprints, auth) {
         var facilityType = blueprints[facility.blueprint];
         var canList = facilityType.production[job.action];
         var target = blueprints[job.target];
@@ -110,16 +191,14 @@ app.post('/jobs', function(req, res) {
             return res.status(401).send("not authorized to access that facility");
         }
 
-        if (!canList.some(function(e) {
+        if (canList === undefined || !canList.some(function(e) {
             return e.item == job.target;
         })) {
             console.log(canList);
             console.log(job.target);
 
-            res.status(400).send("facility is unable to produce that");
+            return res.status(400).send("facility is unable to produce that");
         }
-
-        var promises = [];
 
         if (job.action == "refine") {
             job.outputs = target.refine.outputs;
@@ -135,22 +214,16 @@ app.post('/jobs', function(req, res) {
 
         job.account = auth.account;
 
-        if (queued_jobs[job.facility] === undefined) {
-            queued_jobs[job.facility] = [];
-        }
-
-        if (running_jobs[job.facility] === undefined) {
-            startJob(job);
-        } else {
-            queued_jobs[job.facility].push(job);
-        }
-
-        res.status(201).send({
-            job: {
-                uuid: job.uuid
-            }
+        return dao.jobs.queue(job).then(function() {
+            res.status(201).send({
+                job: {
+                    uuid: job.uuid
+                }
+            });
         });
     }).fail(function(e) {
+        console.log(e);
+        console.log(e.stack);
         res.status(500).send(e.toString());
     }).done();
 });
@@ -158,20 +231,15 @@ app.post('/jobs', function(req, res) {
 app.get('/facilities', function(req, res) {
     C.authorize_req(req).then(function(auth) {
         if (auth.privileged && req.param('all') == 'true') {
-            res.send(facilities);
+            return dao.facilities.all();
         } else {
-            var my_facilities = {};
-
-            for (var key in facilities) {
-                var i = facilities[key];
-                if (i.account == auth.account) {
-                    my_facilities[key] = i;
-                }
-            }
-
-            res.send(my_facilities);
+            return dao.facilities.all(auth.account);
         }
+    }).then(function(list) {
+        res.send(list);
     }).fail(function(e) {
+        console.log(e);
+        console.log(e.stack);
         res.status(500).send(e.toString());
     }).done();
 });
@@ -181,29 +249,26 @@ function updateFacility(uuid, blueprint, account) {
         throw new Error(uuid+" is not a production facility");
     }
 
-    facilities[uuid] = {
-        blueprint: blueprint.uuid,
-        account: account
-    };
-
-    publish({
-        type: 'facility',
+    return dao.facilities.upsert(uuid, {
+        blueprint: blueprint.uuid, 
         account: account,
-        uuid: uuid,
-        blueprint: blueprint.uuid,
+        resources: blueprint.production.generate
+    }).then(function() {
+        publish({
+            type: 'facility',
+            account: account,
+            uuid: uuid,
+            blueprint: blueprint.uuid,
+        });
+
+        // Not every facility is a structure. placeholder
+        // until spodb is external and is the one calling us
+        if (blueprint.type == "structure" || blueprint.type == "deployable") {
+            spodb[uuid] = {
+                blueprint: uuid
+            };
+        }
     });
-
-    if (blueprint.production.generate !== undefined) {
-        resources[uuid] = blueprint.production.generate;
-    }
-
-    // Not every facility is a structure. placeholder
-    // until spodb is external and is the one calling us
-    if (blueprint.type == "structure" || blueprint.type == "deployable") {
-        spodb[uuid] = {
-            blueprint: uuid
-        };
-    }
 }
 
 function getInventoryData(uuid, account) {
@@ -222,27 +287,32 @@ function getInventoryData(uuid, account) {
 }
 
 function destroyFacility(uuid) {
-    var facility = facilities[uuid];
+    return dao.facilities.get(uuid).then(function(facility) {
+        publish({
+            type: 'facility',
+            account: facility.account,
+            tombstone: true,
+            uuid: uuid,
+            blueprint: facility.blueprint,
+        });
+    }).then(function() {
+        // delete running_jobs[uuid]; TODO when should jobs be cleaned up?
+        // delete queued_jobs[uuid];
 
-    publish({
-        type: 'facility',
-        account: facility.account,
-        tombstone: true,
-        uuid: uuid,
-        blueprint: facility.blueprint,
+        return dao.facilities.destroy(uuid);
     });
-
-    delete resources[uuid];
-    delete running_jobs[uuid];
-    delete queued_jobs[uuid];
-    delete facilities[uuid];
 }
 
 // When a ship or production structure is destroyed
 app.delete('/facilities/:uuid', function(req, res) {
-    destroyFacility(req.param('uuid'));
+    destroyFacility(req.param('uuid')).then(function() {
+        res.sendStatus(204);
+    }).fail(function(e) {
+        console.log(e);
+        console.log(e.stack);
+        res.status(500).send(e.toString());
+    }).done();
 
-    res.sendStatus(204);
 });
 
 // TODO this endpoint should be restricted when spodb
@@ -260,18 +330,19 @@ app.post('/facilities/:uuid', function(req, res) {
         var blueprint = blueprints[req.body.blueprint];
 
         if (blueprint && inventory.blueprint == blueprint.uuid) {
-
-            updateFacility(uuid, blueprint, auth.account);
-
-            res.status(201).send({
-                facility: {
-                    uuid: uuid
-                }
+            return updateFacility(uuid, blueprint, auth.account).then(function() {
+                res.status(201).send({
+                    facility: {
+                        uuid: uuid
+                    }
+                });
             });
         } else {
             res.status(400).send("no such blueprint");
         }
     }).fail(function(e) {
+        console.log(e);
+        console.log(e.stack);
         res.status(500).send(e.toString());
     }).done();
 });
@@ -325,54 +396,63 @@ function updateInventoryContainer(uuid, blueprint, account) {
     });
 }
 
-function fullfillResources(job) {
-    job.resourcesInProgress = true;
+function fullfillResources(data) {
+    var job = data.doc;
 
-    return C.getBlueprints().then(function(blueprints) {
-        var promises = [];
+    return Q.all([
+        C.getBlueprints(),
+        dao.jobs.flagNextStatus(data.id, "resourcesFullfilled")
+    ]).spread(function(blueprints) {
         var target = blueprints[job.target];
 
+        publish({
+            type: 'job',
+            account: job.account,
+            uuid: job.uuid,
+            facility: job.facility,
+            state: 'started',
+        });
+
+        console.log("running " + job.uuid + " at " + job.facility);
+
         if (job.action == "refine") {
-            promises.push(consume(job.account, job.facility, job.slice, job.target, job.quantity));
+            return consume(job.account, job.facility, job.slice, job.target, job.quantity);
         } else {
+            var promises = [];
+            console.log(target);
+
             for (var key in target.build.resources) {
                 var count = target.build.resources[key];
                 // TODO do this as a transaction
                 promises.push(consume(job.account, job.facility, job.slice, key, count * job.quantity));
             }
-        }
 
-        return Q.all(promises);
+            return Q.all(promises);
+        }
     }).then(function() {
         job.finishAt = (new Date().getTime() + job.duration * 1000 * job.quantity);
-        job.resourcesFullfilled = true;
-        job.resourcesInProgress = false;
+        return dao.jobs.completeStatus(data.id, "resourcesFullfilled", job);
+    }).then(function() {
         console.log("fullfilled " + job.uuid + " at " + job.facility);
-    }, function(e) {
-        job.resourcesInProgress = false;
-        console.log("failed to fullfilled " + job.uuid + " at " + job.facility + ": " + e.toString());
-    });
+    }).fail(function(e) {
+        console.log("failed to fullfill " + job.uuid + " at " + job.facility + ": " + e.toString());
+        console.log(e.stack);
+        return dao.jobs.failNextStatus(data.id, "resourcesFullfilled");
+    }).done();
 }
 
-function startJob(job) {
-    if (running_jobs[job.facility] === undefined) {
-        running_jobs[job.facility] = job;
-    } else {
-        throw new Error("failed to start job in " + job.facility + ", " + running_jobs[job.facility] + " is already running");
-    }
+function publish(message) {
+    console.log("publishing to %d listeners", listeners.length, message);
 
-    job.resourcesFullfilled = false;
-    job.resourcesInProgress = false;
+    listeners.forEach(function(ws) {
+        var account = ws.upgradeReq.authentication.account;
 
-    publish({
-        type: 'job',
-        account: job.account,
-        uuid: job.uuid,
-        facility: job.facility,
-        state: 'started',
+        if (ws.readyState == WebSockets.OPEN && message.account == account) {
+            ws.send(JSON.stringify(message));
+        } else {
+            console.log("owner %s !== connection %s", message.account, account);
+        }
     });
-
-    console.log("running " + job.uuid + " at " + job.facility);
 }
 
 function deliverJob(job) {
@@ -413,58 +493,68 @@ function deliverJob(job) {
     }
 }
 
-function checkAndProcessFacilityJob(facility) {
-    var timestamp = new Date().getTime();
-    var job = running_jobs[facility];
+function jobDeliveryHandling(data) {
+    var job = data.doc;
+    var facility = data.facility_id;
 
-    if (!job.resourcesFullfilled) {
-        if (!job.resourcesInProgress) {
-            fullfillResources(job);
-        }
-    } else if (job.finishAt < timestamp && job.deliveryStartedAt === undefined) {
-        job.deliveryStartedAt = timestamp;
+    if (job.finishAt > new Date().getTime())
+        return;
 
-        deliverJob(job).then(function() {
-            if (running_jobs[facility] !== undefined && running_jobs[facility].uuid == job.uuid) {
-                console.log("delivered " + job.uuid + " at " + facility);
-                delete running_jobs[facility];
+    return dao.jobs.flagNextStatus(data.id, "delivered").
+        then(function() {
+            return deliverJob(job);
+        }).then(function() {
+            return dao.jobs.completeStatus(data.id, "delivered", job);
+        }).then(function() {
+            console.log("delivered " + job.uuid + " at " + facility);
 
-                publish({
-                    account: job.account,
-                    type: 'job',
-                    uuid: job.uuid,
-                    facility: job.facility,
-                    state: 'delivered',
-                });
-
-                var list = queued_jobs[facility];
-
-                if (list !== undefined && list.length > 0) {
-                    startJob(list[0]);
-                    list.splice(0, 1);
-                }
-            } else {
-                console.log("unknown job running in " + facility, running_jobs[facility]);
-            }
+            publish({
+                account: job.account,
+                type: 'job',
+                uuid: job.uuid,
+                facility: job.facility,
+                state: 'delivered',
+            });
         }, function(e) {
             console.log("failed to deliver job in " + facility + ": " + e.toString());
             delete job.deliveryStartedAt;
-        }).done();
-    }
+        });
 }
 
-function checkAndDeliverResources(uuid) {
-    var resource = resources[uuid];
-    var facility = facilities[uuid];
+function checkAndProcessFacilityJob(facility) {
+    return dao.jobs.nextJob(facility.id).then(function(data) {
+        if (data === undefined) {
+            console.log("no matching jobs");
+            return;
+        
+        } else {
+            console.log(data);
+        }
+
+        switch(data.status) {
+            case "queued":
+                return fullfillResources(data);
+            case "resourcesFullfilled":
+                return jobDeliveryHandling(data);
+            case "delivered":
+                //return dao.jobs.destroy(data.id);
+        }
+    });
+}
+
+function checkAndDeliverResources(facility) {
+    var uuid = facility.id;
     var timestamp = new Date().getTime();
 
-    if (resource.lastDeliveredAt === undefined) {
-        // The first time around this is just a dummy
-        resource.lastDeliveredAt = timestamp;
-    } else if (((resource.lastDeliveredAt + resource.period) < timestamp) && resource.deliveryStartedAt === undefined) {
-        resource.deliveryStartedAt = timestamp;
-        produce(facility.account, uuid, 'default', resource.type, resource.quantity).then(function() {
+    var resource = facility.resources;
 
+    if (facility.resourcesLastDeliveredAt === null) {
+        // The first time around this is just a dummy
+        return db.query("update facilities set resourceDeliveryStartedAt = null, resourcesLastDeliveredAt = $? where id = $1", [ uuid, new Date() ]);
+    } else if (((facility.resourcesLastDeliveredAt.getTime() + resource.period) < timestamp) && facility.resourceDeliveryStartedAt === undefined) {
+        db.query("update facilities set resourceDeliveryStartedAt = $2 where id = $1", [ uuid, new Date() ]).then(function() {
+            return produce(facility.account, uuid, 'default', resource.type, resource.quantity);
+        }).then(function() {
             publish({
                 type: 'resources',
                 account: facility.account,
@@ -474,9 +564,8 @@ function checkAndDeliverResources(uuid) {
                 state: 'delivered'
             });
 
-            resource.lastDeliveredAt = timestamp;
-            delete resource.deliveryStartedAt;
-        }, function(e) {
+            return db.query("update facilities set resourceDeliveryStartedAt = null, resourcesLastDeliveredAt = $? where id = $1", [ uuid, new Date() ]);
+        }).fail(function(e) {
             publish({
                 type: 'resources',
                 account: facility.account,
@@ -487,28 +576,37 @@ function checkAndDeliverResources(uuid) {
             });
 
             console.log("failed to deliver resources from "+uuid+": "+e.toString());
-            delete resource.deliveryStartedAt;
-        });
+            return db.query("update facilities set resourceDeliveryStartedAt = null where id = $1", [ uuid ]);
+        }).done();
     } else {
-        if (resource.deliveryStartedAt) {
+        if (facility.resourceDeliveryStartedAt) {
             console.log("delivery was started for "+uuid+" and I'm still waiting");
         } else {
-            console.log(uuid+" is waiting until "+timestamp+" is greater than "+(resource.lastDeliveredAt+resource.period)+ " "+((resource.lastDeliveredAt + resource.period) > timestamp)+" "+(timestamp - resource.lastDeliveredAt));
+            console.log(uuid+" is waiting until "+timestamp+" is greater than "+(facility.resourcesLastDeliveredAt.getTime()+resource.period)+ " "+((facility.resourcesLastDeliveredAt.getTime() + resource.period) > timestamp)+" "+(timestamp - facility.resourcesLastDeliveredAt));
         }
     }
+
+    return Q(null); // jshint ignore:line
 }
 
 var buildWorker = setInterval(function() {
-    for (var facility in running_jobs) {
-        checkAndProcessFacilityJob(facility);
-    }
-}, 1000);
+    console.log("processing jobs");
 
-var resourceWorker = setInterval(function() {
-    for (var facility in resources) {
-        checkAndDeliverResources(facility);
-    }
-}, 1000);
+    dao.facilities.all().then(function(data) {
+        console.log('data', data);
+        for (var i in data) {
+            var facility = data[i];
+
+            console.log('facility', facility);
+
+            if (facility.resources === null) {
+                checkAndProcessFacilityJob(facility).done();
+            } else {
+                checkAndDeliverResources(facility).done();
+            }
+        }
+    });
+}, 1000); // TODO don't let runs overlap
 
 var server = http.createServer(app);
 server.listen(port);
@@ -527,7 +625,6 @@ var WebSocketServer = WebSockets.Server,
         }
     });
 
-var listeners = [];
 wss.on('connection', function(ws) {
     listeners.push(ws);
 
@@ -538,19 +635,5 @@ wss.on('connection', function(ws) {
         }
     });
 });
-
-function publish(message) {
-    console.log("publishing to %d listeners", listeners.length, message);
-
-    listeners.forEach(function(ws) {
-        var account = ws.upgradeReq.authentication.account;
-
-        if (ws.readyState == WebSockets.OPEN && message.account == account) {
-            ws.send(JSON.stringify(message));
-        } else {
-            console.log("owner %s !== connection %s", message.account, account);
-        }
-    });
-}
 
 console.log("server ready");

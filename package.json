@@ -13,6 +13,9 @@
     "ws": "latest",
     "q": "~1",
     "q-io": "~1",
+    "pg": "latest",
+    "pg-promise": "latest",
+    "postgrator": "latest",
     "node-uuid": "latest",
     "express": "latest"
   },
