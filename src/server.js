@@ -80,13 +80,14 @@ var dao = {
                 });
         },
         queue: function(doc) {
+            var now = new Date();
             return C.db.
-                exec("insert into jobs (id, facility_id, account, doc, status, statusCompletedAt, createdAt) values ($1, $2, $3, $4, $5, $6, $7)", [ doc.uuid, doc.facility, doc.account, doc, "queued", new Date(), new Date() ]);
+                exec("insert into jobs (id, facility_id, account, doc, status, statusCompletedAt, createdAt, trigger_at) values ($1, $2, $3, $4, $5, $6, $7, $8)", [ doc.uuid, doc.facility, doc.account, doc, "queued", now, now, now ]);
         
         },
         nextJob: function(facility_id) {
             return C.db.
-                exec("select * from jobs where facility_id = $1 and status != 'delivered' and next_status is null order by createdAt limit 1", [ facility_id ]).
+                exec("select * from jobs where facility_id = $1 and status != 'delivered' and next_status is null and trigger_at < $2 order by createdAt limit 1", [ facility_id, new Date() ]).
                 then(function(data) {
                     return data[0];
                 });
@@ -566,10 +567,7 @@ function checkAndDeliverResources(facility) {
         if (facility.resourcedeliverystartedat) {
             log("delivery was started for "+uuid+" and I'm still waiting");
         } else {
-            log(
-                uuid+" is waiting until "+timestamp+" is greater than "+(facility.resourceslastdeliveredat.getTime()+resource.period),
-                ((facility.resourceslastdeliveredat.getTime() + resource.period) > timestamp),
-                (facility.resourceslastdeliveredat.getTime() - timestamp));
+            log(uuid+" is waiting for "+moment(facility.resourceslastdeliveredat).add(resource.period, 's').diff(moment()));
         }
     }
 

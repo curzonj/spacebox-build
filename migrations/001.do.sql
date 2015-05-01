@@ -2,16 +2,16 @@ CREATE TABLE facilities (
     id uuid PRIMARY KEY,
     account uuid not null,
     blueprint uuid not null,
-    resourcesLastDeliveredAt timestamp,
-    resourceDeliveryStartedAt timestamp,
+    resourcesLastDeliveredAt timestamp with time zone,
+    resourceDeliveryStartedAt timestamp with time zone,
 
-    trigger_at timestamp,
+    trigger_at timestamp with time zone,
     next_backoff integer not null default 1,
 
     status varchar(255),
     next_status varchar(255),
-    nextStatusStartedAt timestamp,
-    statusCompletedAt timestamp,
+    nextStatusStartedAt timestamp with time zone,
+    statusCompletedAt timestamp with time zone,
     resources json
 );
 
@@ -20,13 +20,13 @@ CREATE TABLE jobs (
     facility_id uuid,
     account uuid not null,
 
-    trigger_at timestamp not null,
+    trigger_at timestamp with time zone not null,
     next_backoff integer not null default 1,
 
     status varchar(255) not null,
-    statusCompletedAt timestamp not null,
+    statusCompletedAt timestamp with time zone not null,
     next_status varchar(255),
-    nextStatusStartedAt timestamp,
-    createdAt timestamp not null,
+    nextStatusStartedAt timestamp with time zone,
+    createdAt timestamp with time zone not null,
     doc json not null
 );
