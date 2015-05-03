@@ -39,7 +39,7 @@ var dao = {
             }
         },
         needAttention: function() {
-            return C.db.query('select * from facilities where trigger_at is null or trigger_at < $1', [ new Date() ])
+            return C.db.query('select * from facilities where trigger_at is null or trigger_at < current_timestamp')
         },
         upsert: function(uuid, doc) {
             return C.db.query('update facilities set blueprint = $2, account = $3, resources = $4 where id =$1 returning id', [ uuid, doc.blueprint, doc.account, doc.resources ]).
@@ -80,14 +80,16 @@ var dao = {
                 })
         },
         queue: function(doc) {
-            var now = new Date()
             return C.db.
-                query("insert into jobs (id, facility_id, account, doc, status, statusCompletedAt, createdAt, trigger_at) values ($1, $2, $3, $4, $5, $6, $7, $8)", [ doc.uuid, doc.facility, doc.account, doc, "queued", now, now, now ])
+                query("insert into jobs (id, facility_id, account, doc, status, statusCompletedAt, createdAt, trigger_at) values ($1, $2, $3, $4, $5, current_timestamp, current_timestamp, current_timestamp)", [ doc.uuid, doc.facility, doc.account, doc, "queued" ])
         
         },
         nextJob: function(facility_id) {
+            // TODO be able to only return stuff based on trigger_at. Currently
+            // that would cause the facility to process other jobs. The facility
+            // needs to have a concept of what jobs it is currently processing.
             return C.db.
-                query("select * from jobs where facility_id = $1 and status != 'delivered' and next_status is null and trigger_at < $2 order by createdAt limit 1", [ facility_id, new Date() ]).
+                query("select * from jobs where facility_id = $1 and status != 'delivered' and next_status is null order by createdAt limit 1", [ facility_id ]).
                 then(function(data) {
                     return data[0]
                 })
@@ -98,16 +100,20 @@ var dao = {
         },
         flagNextStatus: function(uuid, status) {
             return C.db.
-                query("update jobs set next_status = $2, nextStatusStartedAt = $3 where nextStatusStartedAt is null and id = $1 returning id", [ uuid, status, new Date() ]).
+                query("update jobs set next_status = $2, nextStatusStartedAt = current_timestamp where nextStatusStartedAt is null and id = $1 returning id", [ uuid, status ]).
                 then(function(data) {
                     if (data.length === 0) {
                         throw("failed to lock job "+uuid+" for "+status)
                     }
                 })
         },
-        completeStatus: function(uuid, status, doc) {
+        completeStatus: function(uuid, status, doc, trigger_at) {
+            if (moment.isMoment(trigger_at)) {
+                trigger_at = trigger_at.toDate()
+            }
+
             return C.db.
-                query("update jobs set status = next_status, statusCompletedAt = $3, next_status = null, nextStatusStartedAt = null, doc = $4 where id = $1 and next_status = $2 returning id", [ uuid, status, new Date(), doc ]).
+                query("update jobs set status = next_status, statusCompletedAt = current_timestamp, next_status = null, nextStatusStartedAt = null, doc = $3, trigger_at = $4 where id = $1 and next_status = $2 returning id", [ uuid, status, doc, trigger_at ]).
                 then(function(data) {
                     if (data.length === 0) {
                         throw("failed to transition job "+uuid+" to "+status)
@@ -116,7 +122,7 @@ var dao = {
         },
         failNextStatus: function(uuid, status) {
             return C.db.
-                query("update jobs set next_status = null, nextStatusStartedAt = null, where id = $1 and next_status = $2 returning id", [ uuid, status ]).
+                query("update jobs set next_status = null, nextStatusStartedAt = null, next_backoff = next_backoff * 2, trigger_at = current_timestamp + next_backoff where id = $1 and next_status = $2 returning id", [ uuid, status ]).
                 then(function(data) {
                     if (data.length === 0) {
                         throw("failed to fail job transition "+uuid+" to "+status)
@@ -182,30 +188,31 @@ app.post('/jobs', function(req, res) {
             return res.status(404).send("no such facility: " + job.facility)
         }
 
-        var facilityType = blueprints[facility.blueprint]
-        var canList = facilityType.production[job.action]
-        var target = blueprints[job.target]
-
         // Must wait until we have the auth response to check authorization
+        // TODO come up with a better means of authorization
         if (facility.account != auth.account) {
             return res.status(401).send("not authorized to access that facility")
         }
 
+        var facilityType = blueprints[facility.blueprint]
+        var canList = facilityType.production[job.action]
+        var blueprint = blueprints[job.blueprint]
+
         if (canList === undefined || !canList.some(function(e) {
-            return e.item == job.target
+            return e.item == blueprint.uuid
         })) {
             debug(canList)
-            debug(job.target)
+            debug(job.blueprint)
 
             return res.status(400).send("facility is unable to produce that")
         }
 
         if (job.action == "refine") {
-            job.outputs = target.refine.outputs
+            job.outputs = blueprint.refine.outputs
 
-            job.duration = target.refine.time
+            job.duration = blueprint.refine.time
         } else {
-            job.duration = target.build.time
+            job.duration = blueprint.build.time
 
             if (job.action == "construct") {
                 job.quantity = 1
@@ -372,7 +379,7 @@ function fullfillResources(data) {
         C.getBlueprints(),
         dao.jobs.flagNextStatus(data.id, "resourcesFullfilled")
     ]).spread(function(blueprints) {
-        var target = blueprints[job.target]
+        var blueprint = blueprints[job.blueprint]
 
         publish({
             type: 'job',
@@ -385,13 +392,13 @@ function fullfillResources(data) {
         log("running " + job.uuid + " at " + job.facility)
 
         if (job.action == "refine") {
-            return consume(job.account, job.facility, job.slice, job.target, job.quantity)
+            return consume(job.account, job.facility, job.slice, job.blueprint, job.quantity)
         } else {
             var promises = []
-            debug(target)
+            debug(blueprint)
 
-            for (var key in target.build.resources) {
-                var count = target.build.resources[key]
+            for (var key in blueprint.build.resources) {
+                var count = blueprint.build.resources[key]
                 // TODO do this as a transaction
                 promises.push(consume(job.account, job.facility, job.slice, key, count * job.quantity))
             }
@@ -399,11 +406,9 @@ function fullfillResources(data) {
             return Q.all(promises)
         }
     }).then(function() {
-        var now = new Date()
-        var timestamp = now.getTime() + (now.getTimezoneOffset() * 60000)
-
-        job.finishAt = (timestamp + job.duration * 1000 * job.quantity)
-        return dao.jobs.completeStatus(data.id, "resourcesFullfilled", job)
+        var finishAt = moment().add(job.duration * job.quantity, 'seconds')
+        job.finishAt = finishAt.unix()
+        return dao.jobs.completeStatus(data.id, "resourcesFullfilled", job, finishAt)
     }).then(function() {
         log("fullfilled " + job.uuid + " at " + job.facility)
     }).fail(function(e) {
@@ -430,7 +435,7 @@ function publish(message) {
 function deliverJob(job) {
     switch (job.action) {
         case "manufacture":
-            return produce(job.account, job.facility, job.slice, job.target, job.quantity)
+            return produce(job.account, job.facility, job.slice, job.blueprint, job.quantity)
 
         case "refine":
             var promises = []
@@ -447,10 +452,10 @@ function deliverJob(job) {
                 // Updating the facility uuid is because everything
                 // is built on a scaffold, so everything starts as a facility
                 return C.request('3dsim', 'POST', 204, '/spodb/'+job.facility, {
-                    blueprint: job.target })
+                    blueprint: job.blueprint })
             }).then(function() {
                 return C.getBlueprints().then(function(blueprints) {
-                    var blueprint = blueprints[job.target]
+                    var blueprint = blueprints[job.blueprint]
 
                     // If a scaffold was upgraded to a non-production
                     // structure, remove the facility tracking
@@ -460,7 +465,7 @@ function deliverJob(job) {
                         return updateFacility(job.facility, blueprint, job.account)
                     }
                 }).then(function() {
-                    return updateInventoryContainer(job.facility, job.target, job.account)
+                    return updateInventoryContainer(job.facility, job.blueprint, job.account)
                 })
             })
     }
@@ -470,17 +475,17 @@ function jobDeliveryHandling(data) {
     var job = data.doc
     var facility = data.facility_id
 
-    var now = new Date()
-    var timestamp = now.getTime() + (now.getTimezoneOffset() * 60000)
-
-    if (job.finishAt > timestamp)
+    var timestamp = moment.unix(job.finishAt)
+    if (timestamp.isAfter(moment())) {
+        log('received job '+data.id+' at '+facility+' early: '+moment.unix(job.finishAt).fromNow());
         return
+    }
 
     return dao.jobs.flagNextStatus(data.id, "delivered").
         then(function() {
             return deliverJob(job)
         }).then(function() {
-            return dao.jobs.completeStatus(data.id, "delivered", job)
+            return dao.jobs.completeStatus(data.id, "delivered", job, moment().add(10, 'years'))
         }).then(function() {
             log("delivered " + job.uuid + " at " + facility)
 
@@ -491,9 +496,9 @@ function jobDeliveryHandling(data) {
                 facility: job.facility,
                 state: 'delivered',
             })
-        }, function(e) {
+        }).fail(function(e) {
             error("failed to deliver job in " + facility + ": " + e.toString())
-            delete job.deliveryStartedAt
+            return dao.jobs.failNextStatus(data.id, "delivered")
         })
 }
 
@@ -520,8 +525,6 @@ function checkAndProcessFacilityJob(facility) {
 
 function checkAndDeliverResources(facility) {
     var uuid = facility.id
-    var now = new Date()
-    var timestamp = now.getTime() + (now.getTimezoneOffset() * 60000)
 
     debug('resource processing', facility)
 
@@ -529,12 +532,12 @@ function checkAndDeliverResources(facility) {
 
     if (facility.resourceslastdeliveredat === null) {
         // The first time around this is just a dummy
-        return Q(C.db.query("update facilities set resourcedeliverystartedat = null, resourceslastdeliveredat = $2 where id = $1", [ uuid, new Date() ]))
+        return Q(C.db.query("update facilities set resourcedeliverystartedat = null, resourceslastdeliveredat = current_timestamp where id = $1", [ uuid ]))
     } else if (
         moment(facility.resourceslastdeliveredat).add(resource.period, 's').isBefore(moment()) &&
             facility.resourcedeliverystartedat === null
     ) {
-        return Q(C.db.query("update facilities set resourcedeliverystartedat = $2 where id = $1", [ uuid, new Date() ])).then(function() {
+        return Q(C.db.query("update facilities set resourcedeliverystartedat = current_timestamp where id = $1", [ uuid ])).then(function() {
             return produce(facility.account, uuid, 'default', resource.type, resource.quantity)
         }).tap(C.qDebug('checkAndDeliver')).then(function() {
             publish({
@@ -546,8 +549,8 @@ function checkAndDeliverResources(facility) {
                 state: 'delivered'
             })
 
-            return C.db.query("update facilities set resourcedeliverystartedat = null, next_backoff = 1, resourceslastdeliveredat = $2, trigger_at = $3 where id = $1",
-                            [ uuid, new Date(), moment().add(resource.period, 's').toDate() ])
+            return C.db.query("update facilities set resourcedeliverystartedat = null, next_backoff = '1 second', resourceslastdeliveredat = current_timestamp, trigger_at = $2 where id = $1",
+                            [ uuid, moment().add(resource.period, 's').toDate() ])
         }).fail(function(e) {
             error("failed to deliver resources from "+uuid+": "+e.toString())
 
@@ -560,8 +563,8 @@ function checkAndDeliverResources(facility) {
                 state: 'delivery_failed'
             })
 
-            return C.db.query("update facilities set resourcedeliverystartedat = null, next_backoff = $2, trigger_at = $3 where id = $1",
-                            [ uuid, facility.next_backoff * 2, moment().add(facility.next_backoff, 's').toDate() ])
+            return C.db.query("update facilities set resourcedeliverystartedat = null, next_backoff = next_backoff * 2, trigger_at = current_timestamp + next_backoff where id = $1",
+                            [ uuid ])
         })
     } else {
         if (facility.resourcedeliverystartedat) {

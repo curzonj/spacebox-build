@@ -6,7 +6,7 @@ CREATE TABLE facilities (
     resourceDeliveryStartedAt timestamp with time zone,
 
     trigger_at timestamp with time zone,
-    next_backoff integer not null default 1,
+    next_backoff interval not null default '1 second',
 
     status varchar(255),
     next_status varchar(255),
@@ -21,7 +21,7 @@ CREATE TABLE jobs (
     account uuid not null,
 
     trigger_at timestamp with time zone not null,
-    next_backoff integer not null default 1,
+    next_backoff interval not null default '1 second',
 
     status varchar(255) not null,
     statusCompletedAt timestamp with time zone not null,
