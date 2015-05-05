@@ -85,11 +85,8 @@ var dao = {
         
         },
         nextJob: function(facility_id) {
-            // TODO be able to only return stuff based on trigger_at. Currently
-            // that would cause the facility to process other jobs. The facility
-            // needs to have a concept of what jobs it is currently processing.
             return C.db.
-                query("select * from jobs where facility_id = $1 and status != 'delivered' and next_status is null order by createdAt limit 1", [ facility_id ]).
+                query("with thenextjob as (select * from jobs where facility_id = $1 and status != 'delivered' order by createdAt limit 1) select * from thenextjob where next_status is null and trigger_at < current_timestamp", [ facility_id ]).
                 then(function(data) {
                     return data[0]
                 })
