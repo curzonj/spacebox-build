@@ -13,9 +13,10 @@ var http = require("http"),
     Q = require('q'),
     qhttp = require("q-io/http"),
     WebSockets = require("ws"),
+    db = require('spacebox-common-native').db,
     C = require('spacebox-common')
 
-C.db.select('build')
+db.select('build')
 Q.longStackSupport = true
 
 var app = express()
@@ -33,30 +34,30 @@ var dao = {
     facilities: {
         all: function(account) {
             if (account === undefined) {
-                return C.db.query('select * from facilities')
+                return db.query('select * from facilities')
             } else {
-                return C.db.query('select * from facilities', [ account ])
+                return db.query('select * from facilities', [ account ])
             }
         },
         needAttention: function() {
-            return C.db.query('select * from facilities where trigger_at is null or trigger_at < current_timestamp')
+            return db.query('select * from facilities where trigger_at is null or trigger_at < current_timestamp')
         },
         upsert: function(uuid, doc) {
-            return C.db.query('update facilities set blueprint = $2, account = $3, resources = $4 where id =$1 returning id', [ uuid, doc.blueprint, doc.account, doc.resources ]).
+            return db.query('update facilities set blueprint = $2, account = $3, resources = $4 where id =$1 returning id', [ uuid, doc.blueprint, doc.account, doc.resources ]).
                 then(function(data) {
                     debug(data)
                     if (data.length === 0) {
-                        return C.db.
+                        return db.
                             query('insert into facilities (id, blueprint, account, resources) values ($1, $2, $3, $4)', [ uuid, doc.blueprint, doc.account, doc.resources ])
                     }
                 })
         },
         destroy: function(uuid) {
-            return C.db.
+            return db.
                 query("delete from facilities where id=$1", [ uuid ])
         },
         get: function(uuid) {
-            return C.db.
+            return db.
                 query("select * from facilities where id=$1", [ uuid ]).
                 then(function(data) {
                     return data[0]
@@ -67,36 +68,36 @@ var dao = {
     jobs: {
         all: function(account) {
             if (account === undefined) {
-                return C.db.query("select * from jobs")
+                return db.query("select * from jobs")
             } else {
-                return C.db.query("select * from jobs where account=$1", [ account ])
+                return db.query("select * from jobs where account=$1", [ account ])
             }
         },
         get: function(uuid, account) {
-            return C.db.
+            return db.
                 query("select * from jobs where id=$1 and account=$1", [ uuid, account ]).
                 then(function(data) {
                     return data[0]
                 })
         },
         queue: function(doc) {
-            return C.db.
+            return db.
                 query("insert into jobs (id, facility_id, account, doc, status, statusCompletedAt, createdAt, trigger_at) values ($1, $2, $3, $4, $5, current_timestamp, current_timestamp, current_timestamp)", [ doc.uuid, doc.facility, doc.account, doc, "queued" ])
         
         },
         nextJob: function(facility_id) {
-            return C.db.
+            return db.
                 query("with thenextjob as (select * from jobs where facility_id = $1 and status != 'delivered' order by createdAt limit 1) select * from thenextjob where next_status is null and trigger_at < current_timestamp", [ facility_id ]).
                 then(function(data) {
                     return data[0]
                 })
         },
         destroy: function(uuid) {
-            return C.db.
+            return db.
                 query("delete from jobs where id =$1", [ uuid ])
         },
         flagNextStatus: function(uuid, status) {
-            return C.db.
+            return db.
                 query("update jobs set next_status = $2, nextStatusStartedAt = current_timestamp where nextStatusStartedAt is null and id = $1 returning id", [ uuid, status ]).
                 then(function(data) {
                     if (data.length === 0) {
@@ -109,7 +110,7 @@ var dao = {
                 trigger_at = trigger_at.toDate()
             }
 
-            return C.db.
+            return db.
                 query("update jobs set status = next_status, statusCompletedAt = current_timestamp, next_status = null, nextStatusStartedAt = null, doc = $3, trigger_at = $4 where id = $1 and next_status = $2 returning id", [ uuid, status, doc, trigger_at ]).
                 then(function(data) {
                     if (data.length === 0) {
@@ -118,7 +119,7 @@ var dao = {
                 })
         },
         failNextStatus: function(uuid, status) {
-            return C.db.
+            return db.
                 query("update jobs set next_status = null, nextStatusStartedAt = null, next_backoff = next_backoff * 2, trigger_at = current_timestamp + next_backoff where id = $1 and next_status = $2 returning id", [ uuid, status ]).
                 then(function(data) {
                     if (data.length === 0) {
@@ -136,7 +137,7 @@ function hashForEach(obj, fn) {
 }
 
 app.get('/jobs/:uuid', function(req, res) {
-    C.authorize_req(req).then(function(auth) {
+    C.http.authorize_req(req).then(function(auth) {
         dao.jobs.get(req.param('uuid'), auth.account).
             then(function(data) {
                 res.send(data)
@@ -145,7 +146,7 @@ app.get('/jobs/:uuid', function(req, res) {
 })
 
 app.get('/jobs', function(req, res) {
-    C.authorize_req(req).then(function(auth) {
+    C.http.authorize_req(req).then(function(auth) {
         dao.jobs.
             all(auth.privileged && req.param('all') == 'true' ? undefined : auth.account).
             then(function(data) {
@@ -155,7 +156,7 @@ app.get('/jobs', function(req, res) {
 })
 
 app.get('/jobs', function(req, res) {
-    C.authorize_req(req).then(function(auth) {
+    C.http.authorize_req(req).then(function(auth) {
         dao.jobs.
             all(auth.privileged && req.param('all') == 'true' ? undefined : auth.account).
             then(function(data) {
@@ -180,7 +181,7 @@ app.post('/jobs', function(req, res) {
 
     job.uuid = uuidGen.v1()
 
-    Q.spread([C.getBlueprints(), C.authorize_req(req), dao.facilities.get(job.facility)], function(blueprints, auth, facility) {
+    Q.spread([C.getBlueprints(), C.http.authorize_req(req), dao.facilities.get(job.facility)], function(blueprints, auth, facility) {
         if (facility === undefined) {
             return res.status(404).send("no such facility: " + job.facility)
         }
@@ -229,7 +230,7 @@ app.post('/jobs', function(req, res) {
 })
 
 app.get('/facilities', function(req, res) {
-    C.authorize_req(req).then(function(auth) {
+    C.http.authorize_req(req).then(function(auth) {
         if (auth.privileged && req.param('all') == 'true') {
             return dao.facilities.all()
         } else {
@@ -302,7 +303,7 @@ app.delete('/facilities/:uuid', function(req, res) {
 // TODO this endpoint should be restricted when spodb
 // starts calling it and users don't have to anymore
 app.post('/facilities/:uuid', function(req, res) {
-    var authP = C.authorize_req(req)
+    var authP = C.http.authorize_req(req)
     var uuid = req.param('uuid')
     var inventoryP = authP.then(function(auth) {
         // This verifies that the inventory exists and
@@ -529,12 +530,12 @@ function checkAndDeliverResources(facility) {
 
     if (facility.resourceslastdeliveredat === null) {
         // The first time around this is just a dummy
-        return Q(C.db.query("update facilities set resourcedeliverystartedat = null, resourceslastdeliveredat = current_timestamp where id = $1", [ uuid ]))
+        return Q(db.query("update facilities set resourcedeliverystartedat = null, resourceslastdeliveredat = current_timestamp where id = $1", [ uuid ]))
     } else if (
         moment(facility.resourceslastdeliveredat).add(resource.period, 's').isBefore(moment()) &&
             facility.resourcedeliverystartedat === null
     ) {
-        return Q(C.db.query("update facilities set resourcedeliverystartedat = current_timestamp where id = $1", [ uuid ])).then(function() {
+        return Q(db.query("update facilities set resourcedeliverystartedat = current_timestamp where id = $1", [ uuid ])).then(function() {
             return produce(facility.account, uuid, 'default', resource.type, resource.quantity)
         }).tap(C.qDebug('checkAndDeliver')).then(function() {
             publish({
@@ -546,7 +547,7 @@ function checkAndDeliverResources(facility) {
                 state: 'delivered'
             })
 
-            return C.db.query("update facilities set resourcedeliverystartedat = null, next_backoff = '1 second', resourceslastdeliveredat = current_timestamp, trigger_at = $2 where id = $1",
+            return db.query("update facilities set resourcedeliverystartedat = null, next_backoff = '1 second', resourceslastdeliveredat = current_timestamp, trigger_at = $2 where id = $1",
                             [ uuid, moment().add(resource.period, 's').toDate() ])
         }).fail(function(e) {
             error("failed to deliver resources from "+uuid+": "+e.toString())
@@ -560,7 +561,7 @@ function checkAndDeliverResources(facility) {
                 state: 'delivery_failed'
             })
 
-            return C.db.query("update facilities set resourcedeliverystartedat = null, next_backoff = next_backoff * 2, trigger_at = current_timestamp + next_backoff where id = $1",
+            return db.query("update facilities set resourcedeliverystartedat = null, next_backoff = next_backoff * 2, trigger_at = current_timestamp + next_backoff where id = $1",
                             [ uuid ])
         })
     } else {
@@ -602,7 +603,7 @@ var WebSocketServer = WebSockets.Server,
     wss = new WebSocketServer({
         server: server,
         verifyClient: function (info, callback) {
-            C.authorize_req(info.req).then(function(auth) {
+            C.http.authorize_req(info.req).then(function(auth) {
                 info.req.authentication = auth
                 callback(true)
             }, function(e) {

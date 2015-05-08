@@ -1,3 +1,5 @@
+CREATE EXTENSION "uuid-ossp";
+
 CREATE TABLE facilities (
     id uuid PRIMARY KEY,
     account uuid not null,
