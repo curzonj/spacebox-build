@@ -143,16 +143,16 @@ function hashForEach(obj, fn) {
 
 app.get('/jobs/:uuid', function(req, res) {
     C.http.authorize_req(req).then(function(auth) {
-        dao.jobs.get(req.param('uuid'), auth.account).
+        return dao.jobs.get(req.param('uuid'), auth.account).
             then(function(data) {
                 res.send(data)
             })
-    })
+    }).fail(C.http.errHandler(req, res, error)).done()
 })
 
 app.get('/jobs', function(req, res) {
     C.http.authorize_req(req).then(function(auth) {
-        dao.jobs.
+        return dao.jobs.
             all(auth.privileged && req.param('all') == 'true' ? undefined : auth.account).
             then(function(data) {
                 res.send(data)
@@ -167,7 +167,7 @@ app.get('/jobs', function(req, res) {
             then(function(data) {
                 res.send(data)
             })
-    })
+    }).fail(C.http.errHandler(req, res, error)).done()
 })
 
 // players cancel jobs
