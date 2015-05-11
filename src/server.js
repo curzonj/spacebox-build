@@ -3,6 +3,7 @@
 var http = require("http"),
     express = require("express"),
     logger = require('morgan'),
+    uriUtils = require('url'),
     bodyParser = require('body-parser'),
     uuidGen = require('node-uuid'),
     moment = require('moment'),
@@ -41,7 +42,7 @@ var dao = {
             if (account === undefined) {
                 return db.query('select * from facilities')
             } else {
-                return db.query('select * from facilities', [ account ])
+                return db.query('select * from facilities where account = $1', [ account ])
             }
         },
         needAttention: function() {
@@ -160,16 +161,6 @@ app.get('/jobs', function(req, res) {
     })
 })
 
-app.get('/jobs', function(req, res) {
-    C.http.authorize_req(req).then(function(auth) {
-        dao.jobs.
-            all(auth.privileged && req.param('all') == 'true' ? undefined : auth.account).
-            then(function(data) {
-                res.send(data)
-            })
-    }).fail(C.http.errHandler(req, res, error)).done()
-})
-
 // players cancel jobs
 app.delete('/jobs/:uuid', function(req, res) {
     // does the user get the resources back?
@@ -265,21 +256,6 @@ function updateFacility(uuid, blueprint, account) {
     })
 }
 
-function getInventoryData(uuid, account) {
-    return C.getAuthToken().then(function(token) {
-        return qhttp.read({
-            method: "GET",
-            url: process.env.INVENTORY_URL + '/inventory/' + uuid,
-            headers: {
-                "Authorization": "Bearer " + token + '/' + account,
-                "Content-Type": "application/json"
-            }
-        }).then(function(body) {
-            return JSON.parse(body.toString())
-        })
-    })
-}
-
 function destroyFacility(uuid) {
     return dao.facilities.get(uuid).then(function(facility) {
         publish({
@@ -305,15 +281,16 @@ app.delete('/facilities/:uuid', function(req, res) {
 
 })
 
-// TODO this endpoint should be restricted when spodb
-// starts calling it and users don't have to anymore
 app.post('/facilities/:uuid', function(req, res) {
-    var authP = C.http.authorize_req(req)
     var uuid = req.param('uuid')
+
+    var authP = C.http.authorize_req(req, true)
     var inventoryP = authP.then(function(auth) {
         // This verifies that the inventory exists and
         // is owned by the same account
-        return getInventoryData(uuid, auth.account)
+        return C.request('inventory', 'GET', 200, '/inventory/'+uuid, undefined, {
+            sudo_account: auth.account
+        })
     })
 
     Q.spread([C.getBlueprints(), authP, inventoryP], function(blueprints, auth, inventory) {
@@ -608,11 +585,13 @@ var WebSocketServer = WebSockets.Server,
     wss = new WebSocketServer({
         server: server,
         verifyClient: function (info, callback) {
-            C.http.authorize_req(info.req).then(function(auth) {
+            var parts = uriUtils.parse(info.req.url, true)
+            var token = parts.query.token
+
+            C.http.authorize_token(token).then(function(auth) {
                 info.req.authentication = auth
                 callback(true)
             }, function(e) {
-                info.req.authentication = {}
                 callback(false)
             })
         }
